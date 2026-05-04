@@ -1,6 +1,0 @@
-# 可以写完整命令，也可以只写 dreamina 的子命令。
-# 空行和 # 注释会被忽略。
-
-multimodal2video --image ./assets/shot-01.png --prompt "把画面做成真实电影感，轻微推镜" --model_version=seedance2.0fast --duration=5 --ratio=9:16
-multimodal2video --image ./assets/shot-02.png --prompt "延续上一镜的情绪，角色继续前进" --model_version=seedance2.0fast --duration=5 --ratio=9:16
-text2video --prompt "手机竖屏9:16，真实纪实风格，女孩在便利店门口回头" --model_version=seedance2.0fast --duration=5 --ratio=9:16

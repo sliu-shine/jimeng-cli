@@ -1,0 +1,17 @@
+## 爆款文案智能体依赖
+
+# 核心
+anthropic>=0.40.0
+chromadb>=0.5.0
+sentence-transformers>=3.0.0
+
+# 音频转录（二选一）
+openai-whisper>=20231117      # 本地 Whisper（精度高，需要 GPU）
+groq>=0.9.0                   # Groq API（更快，有免费额度）
+
+# 视频处理
+yt-dlp>=2024.1.0              # 视频下载
+# ffmpeg 需要单独安装: brew install ffmpeg
+
+# 可选：抖音数据抓取
+httpx>=0.27.0                 # HTTP 客户端

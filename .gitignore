@@ -7,3 +7,29 @@ __pycache__
 skills
 tests
 web-output
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# System files
+.DS_Store
+
+# Environment variables
+.env
+
+# Logs
+*.log
+import_log.txt
+
+# Temporary directories
+douyin_videos/
+test_douyin/
+test_download/
+
+# Database
+.viral_kb/
+
+# Web UI data
+.webui/

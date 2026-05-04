@@ -1,18 +1,20 @@
 {
-  "pid": 96903,
+  "pid": 9858,
   "running": false,
   "started_at": null,
-  "queue_file": "/Users/sliu/web-project/rich-projects/jimeng-cli/.webui/web.queue.json",
+  "queue_file": "/Users/sliu/web-project/rich-projects/jimeng-cli/.webui/global.queue.json",
   "output_root": "/Users/sliu/web-project/rich-projects/jimeng-cli/web-output",
   "state_file": "/Users/sliu/web-project/rich-projects/jimeng-cli/web-output/queue-state.json",
   "dreamina": "/Users/sliu/.local/bin/dreamina",
+  "active_project_id": "project-69da7b0017",
+  "active_project_name": "唯美梦境",
   "command": [
     "/opt/homebrew/opt/python@3.14/bin/python3.14",
     "/Users/sliu/web-project/rich-projects/jimeng-cli/dreamina_queue.py",
     "--dreamina",
     "/Users/sliu/.local/bin/dreamina",
     "--queue-file",
-    "/Users/sliu/web-project/rich-projects/jimeng-cli/.webui/web.queue.json",
+    "/Users/sliu/web-project/rich-projects/jimeng-cli/.webui/global.queue.json",
     "--output-root",
     "/Users/sliu/web-project/rich-projects/jimeng-cli/web-output",
     "--state-file",
@@ -23,5 +25,5 @@
     "10800"
   ],
   "log_file": "/Users/sliu/web-project/rich-projects/jimeng-cli/.webui/runner.log",
-  "finished_at": "2026-04-28T01:00:03+0800"
+  "finished_at": "2026-04-30T22:52:55+0800"
 }

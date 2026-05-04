@@ -27,13 +27,27 @@ ROOT = Path(__file__).resolve().parent
 APP_DIR = ROOT / ".webui"
 DEFAULT_QUEUE_FILE = APP_DIR / "web.queue.json"
 LEGACY_DEFAULT_QUEUE_FILE = APP_DIR / "web.queue.txt"
+PROJECTS_DIR = APP_DIR / "projects"
+PROJECTS_INDEX_FILE = APP_DIR / "projects.json"
+GLOBAL_QUEUE_FILE = APP_DIR / "global.queue.json"
 DEFAULT_OUTPUT_ROOT = ROOT / "web-output"
 DEFAULT_STATE_FILE = DEFAULT_OUTPUT_ROOT / "queue-state.json"
 RUNNER_META_FILE = APP_DIR / "runner.json"
 RUNNER_LOG_FILE = APP_DIR / "runner.log"
 UI_CONFIG_FILE = APP_DIR / "ui-config.json"
 UPLOAD_DIR = APP_DIR / "uploads"
+DOUYIN_ACCOUNTS_FILE = APP_DIR / "douyin_accounts.json"
+DOUYIN_STATUS_FILE = APP_DIR / "douyin_status.json"
 LOCK = threading.Lock()
+
+# 抖音下载任务状态
+douyin_task = {
+    "downloader": None,
+    "thread": None,
+    "is_running": False,
+    "logs": [],
+    "accounts_status": []
+}
 
 
 def ensure_dir(path: Path) -> None:
@@ -43,7 +57,13 @@ def ensure_dir(path: Path) -> None:
 def load_json(path: Path, default: Any) -> Any:
     if not path.exists():
         return default
-    return json.loads(path.read_text(encoding="utf-8"))
+    try:
+        content = path.read_text(encoding="utf-8").strip()
+        if not content:
+            return default
+        return json.loads(content)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return default
 
 
 def detect_dreamina_path() -> str | None:
@@ -65,7 +85,13 @@ def detect_dreamina_path() -> str | None:
 
 def save_json(path: Path, payload: Any) -> None:
     ensure_dir(path.parent)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
 
 def normalize_queue_file_path(value: Any = None) -> Path:
@@ -278,27 +304,33 @@ def visible_queue_text(state: dict[str, Any], queue_file: Path) -> str:
     if not isinstance(tasks, list) or not tasks or not segments:
         return raw_text
 
-    success_ids = {
+    terminal_statuses = {"success", "failed", "fail", "rejected", "banned", "error", "cancelled"}
+
+    def is_completed(task: dict[str, Any]) -> bool:
+        if task.get("fail_reason"):
+            return True
+        return str(task.get("status") or "").strip().lower() in terminal_statuses
+
+    completed_ids = {
         str(task.get("segment_id") or "").strip()
         for task in tasks
-        if str(task.get("status") or "").strip().lower() == "success" and str(task.get("segment_id") or "").strip()
+        if is_completed(task) and str(task.get("segment_id") or "").strip()
     }
-    success_counts: dict[str, int] = {}
+    completed_counts: dict[str, int] = {}
     for task in tasks:
         command = str(task.get("command") or "").strip()
-        status = str(task.get("status") or "").strip().lower()
-        if command and status == "success":
-            success_counts[command] = success_counts.get(command, 0) + 1
+        if command and is_completed(task):
+            completed_counts[command] = completed_counts.get(command, 0) + 1
 
     visible_segments: list[dict[str, Any]] = []
     for segment in segments:
         segment_id = str(segment.get("id") or "").strip()
-        if segment_id and segment_id in success_ids:
+        if segment_id and segment_id in completed_ids:
             continue
         command = str(segment.get("command") or "").strip()
-        matched = success_counts.get(command, 0)
+        matched = completed_counts.get(command, 0)
         if command and matched > 0:
-            success_counts[command] = matched - 1
+            completed_counts[command] = matched - 1
             continue
         visible_segments.append(segment)
 
@@ -319,6 +351,420 @@ def parse_line_values(value: Any) -> list[str]:
     else:
         items = str(value).splitlines()
     return [str(item).strip() for item in items if str(item).strip()]
+
+
+def project_dir(project_id: str) -> Path:
+    return PROJECTS_DIR / project_folder_name(project_id)
+
+
+def project_file(project_id: str) -> Path:
+    return project_dir(project_id) / "project.json"
+
+
+def project_queue_file(project_id: str) -> Path:
+    return project_dir(project_id) / "queue.json"
+
+
+def project_upload_root(project_id: str) -> Path:
+    return project_dir(project_id) / "uploads"
+
+
+def project_output_root(project_id: str, base_output_root: Path | None = None) -> Path:
+    base = base_output_root or DEFAULT_OUTPUT_ROOT
+    return base / "projects" / project_folder_name(project_id)
+
+
+def short_project_suffix(project_id: str) -> str:
+    value = sanitize_filename(project_id)
+    if value.startswith("project-"):
+        return value.split("project-", 1)[1][:10] or value[-10:]
+    return value[-10:]
+
+
+def make_project_folder_name(name: str, project_id: str) -> str:
+    stem = sanitize_filename(name or "项目")
+    suffix = short_project_suffix(project_id)
+    return sanitize_filename(f"{stem}-{suffix}") if suffix else stem
+
+
+def is_legacy_project_folder(folder: str, project_id: str) -> bool:
+    return sanitize_filename(folder) == sanitize_filename(project_id)
+
+
+def project_folder_name(project_id: str) -> str:
+    safe_id = sanitize_filename(project_id)
+    index = load_json(PROJECTS_INDEX_FILE, {})
+    raw_projects = index.get("projects") if isinstance(index, dict) else None
+    if isinstance(raw_projects, list):
+        for item in raw_projects:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("id") or "") == project_id and item.get("folder"):
+                return sanitize_filename(str(item.get("folder")))
+
+    direct = PROJECTS_DIR / safe_id / "project.json"
+    if direct.exists():
+        return safe_id
+
+    if PROJECTS_DIR.is_dir():
+        for path in PROJECTS_DIR.glob("*/project.json"):
+            try:
+                payload = load_json(path, {})
+            except Exception:
+                continue
+            if str(payload.get("id") or "") == project_id:
+                return path.parent.name
+    return safe_id
+
+
+def default_project_record(name: str = "默认项目") -> dict[str, Any]:
+    project_id = f"project-{uuid.uuid4().hex[:10]}"
+    timestamp = now_iso()
+    return {
+        "id": project_id,
+        "name": name,
+        "description": "",
+        "created_at": timestamp,
+        "updated_at": timestamp,
+    }
+
+
+def normalize_project_record(project: dict[str, Any], index: int = 1, fallback_id: str | None = None) -> dict[str, Any]:
+    project_id = str(project.get("id") or fallback_id or f"project-{uuid.uuid4().hex[:10]}").strip()
+    name = str(project.get("name") or f"项目{index}").strip() or f"项目{index}"
+    folder = str(project.get("folder") or "").strip()
+    if not folder or is_legacy_project_folder(folder, project_id):
+        folder = make_project_folder_name(name, project_id)
+    return {
+        "id": sanitize_filename(project_id),
+        "name": name,
+        "folder": sanitize_filename(folder),
+        "description": str(project.get("description") or ""),
+        "created_at": str(project.get("created_at") or now_iso()),
+        "updated_at": str(project.get("updated_at") or now_iso()),
+    }
+
+
+def save_project_record(project: dict[str, Any]) -> dict[str, Any]:
+    normalized = normalize_project_record(project)
+    old_dir = project_dir(normalized["id"])
+    next_dir = PROJECTS_DIR / normalized["folder"]
+    if old_dir.exists() and old_dir != next_dir and not next_dir.exists():
+        old_dir.rename(next_dir)
+    ensure_dir(next_dir)
+    save_json(next_dir / "project.json", normalized)
+    return normalized
+
+
+def load_project_record(project_id: str) -> dict[str, Any] | None:
+    path = project_file(project_id)
+    if not path.exists():
+        return None
+    payload = load_json(path, {})
+    if isinstance(payload, dict) and not payload.get("folder"):
+        payload["folder"] = path.parent.name
+    return normalize_project_record(payload, fallback_id=project_id)
+
+
+def load_projects() -> list[dict[str, Any]]:
+    ensure_dir(PROJECTS_DIR)
+    
+    # 优先从物理目录扫描，确保不漏掉任何项目
+    projects: list[dict[str, Any]] = []
+    seen_folders = set()
+    
+    # 扫描所有物理文件夹
+    for path in sorted(PROJECTS_DIR.glob("*/project.json")):
+        folder_name = path.parent.name
+        if folder_name in seen_folders:
+            continue
+            
+        payload = load_json(path, {})
+        # 如果文件为空或损坏，尝试从文件夹名恢复
+        fallback_name = "新项目"
+        fallback_id = None
+        
+        if "-" in folder_name:
+            parts = folder_name.split("-")
+            if len(parts) >= 2:
+                fallback_id = f"project-{parts[-1]}"
+                fallback_name = "-".join(parts[:-1])
+        
+        if isinstance(payload, dict):
+            if not payload.get("name"):
+                payload["name"] = fallback_name
+            if not payload.get("folder"):
+                payload["folder"] = folder_name
+        else:
+            payload = {"name": fallback_name, "folder": folder_name}
+            
+        stored = normalize_project_record(payload, index=len(projects) + 1, fallback_id=fallback_id)
+        projects.append(save_project_record(stored))
+        seen_folders.add(folder_name)
+
+    # 如果物理目录没有任何项目，创建一个默认的
+    if not projects:
+        projects = [create_project("默认项目", migrate_legacy=True)]
+    
+    save_projects_index(projects)
+    return projects
+
+
+def save_projects_index(projects: list[dict[str, Any]]) -> None:
+    normalized = [normalize_project_record(project, index) for index, project in enumerate(projects, start=1)]
+    for project in normalized:
+        save_project_record(project)
+    save_json(PROJECTS_INDEX_FILE, {"version": 1, "projects": normalized})
+
+
+def create_project(name: str, *, migrate_legacy: bool = False) -> dict[str, Any]:
+    project = save_project_record(default_project_record(name.strip() or "新项目"))
+    queue_path = project_queue_file(project["id"])
+    ensure_dir(queue_path.parent)
+    if migrate_legacy and DEFAULT_QUEUE_FILE.exists():
+        queue_path.write_text(DEFAULT_QUEUE_FILE.read_text(encoding="utf-8"), encoding="utf-8")
+    elif not queue_path.exists():
+        queue_path.write_text(queue_document_to_text(default_queue_document()), encoding="utf-8")
+    for kind in ["image", "video", "audio"]:
+        ensure_dir(project_upload_root(project["id"]) / kind)
+    return project
+
+
+def get_active_project_id(ui_config: dict[str, Any] | None = None) -> str:
+    return get_active_project(ui_config)["id"]
+
+
+def get_active_project(ui_config: dict[str, Any] | None = None) -> dict[str, Any]:
+    projects = load_projects()
+    if not projects:
+        raise RuntimeError("没有可用项目。")
+    
+    config = ui_config if ui_config is not None else load_ui_config()
+    active_id = str(config.get("active_project_id") or "").strip()
+    
+    for project in projects:
+        if project["id"] == active_id:
+            return project
+            
+    # 没找到或没设置，选第一个
+    active_id = projects[0]["id"]
+    save_ui_config({"active_project_id": active_id})
+    return projects[0]
+
+
+def set_active_project(project_id: str) -> dict[str, Any]:
+    projects = load_projects()
+    for project in projects:
+        if project["id"] == project_id:
+            save_ui_config({"active_project_id": project_id})
+            return project
+    raise ValueError("项目不存在。")
+
+
+def rename_project(project_id: str, name: str) -> dict[str, Any]:
+    projects = load_projects()
+    next_projects: list[dict[str, Any]] = []
+    renamed: dict[str, Any] | None = None
+    for project in projects:
+        if project["id"] == project_id:
+            project = dict(project)
+            project["name"] = name.strip() or project["name"]
+            project["folder"] = make_project_folder_name(project["name"], project["id"])
+            project["updated_at"] = now_iso()
+            renamed = save_project_record(project)
+            next_projects.append(renamed)
+        else:
+            next_projects.append(project)
+    if not renamed:
+        raise ValueError("项目不存在。")
+    save_projects_index(next_projects)
+    return renamed
+
+
+def success_segment_ids(state: dict[str, Any]) -> set[str]:
+    ids: set[str] = set()
+    terminal_statuses = {"success", "failed", "fail", "rejected", "banned", "error", "cancelled"}
+    for task in state.get("tasks") or []:
+        status = str(task.get("status") or "").lower()
+        if status not in terminal_statuses:
+            continue
+        segment_id = str(task.get("segment_id") or "").strip()
+        project_id = str(task.get("project_id") or "").strip()
+        if project_id and segment_id:
+            ids.add(f"{project_id}:{segment_id}")
+        elif segment_id:
+            ids.add(segment_id)
+    return ids
+
+
+def success_segment_signatures(state: dict[str, Any]) -> set[tuple[str, str, str]]:
+    signatures: set[tuple[str, str, str]] = set()
+    terminal_statuses = {"success", "failed", "fail", "rejected", "banned", "error", "cancelled"}
+    for task in state.get("tasks") or []:
+        status = str(task.get("status") or "").lower()
+        if status not in terminal_statuses:
+            continue
+        project_id = str(task.get("project_id") or "").strip()
+        segment_id = str(task.get("segment_id") or "").strip()
+        command = str(task.get("command") or "").strip()
+        if segment_id and command:
+            signatures.add((project_id, segment_id, command))
+    return signatures
+
+
+def project_task_counts(project_id: str, state: dict[str, Any]) -> dict[str, int]:
+    queue_path = project_queue_file(project_id)
+    try:
+        segments = parse_queue_document(queue_file_text(queue_path)).get("segments", [])
+    except Exception:
+        segments = []
+    project_tasks = [
+        task for task in state.get("tasks") or []
+        if str(task.get("project_id") or "") == project_id
+    ]
+    return {
+        "queued": len(segments),
+        "running": sum(1 for task in project_tasks if str(task.get("status") or "") == "running"),
+        "success": sum(1 for task in project_tasks if str(task.get("status") or "") == "success"),
+        "failed": sum(1 for task in project_tasks if str(task.get("status") or "") == "failed"),
+    }
+
+
+def projects_for_payload(state: dict[str, Any], base_output_root: Path | None = None) -> list[dict[str, Any]]:
+    return [
+        {
+            **project,
+            "queue_file": str(project_queue_file(project["id"])),
+            "upload_root": str(project_upload_root(project["id"])),
+            "output_root": str(project_output_root(project["id"], base_output_root)),
+            "counts": project_task_counts(project["id"], state),
+        }
+        for project in load_projects()
+    ]
+
+
+def compose_global_queue_document(state: dict[str, Any], base_output_root: Path | None = None) -> dict[str, Any]:
+    completed = success_segment_signatures(state)
+    global_segments: list[dict[str, Any]] = []
+    for project in load_projects():
+        queue_path = project_queue_file(project["id"])
+        document = parse_queue_document(queue_file_text(queue_path))
+        for segment in document.get("segments", []):
+            segment_id = str(segment.get("id") or "").strip()
+            command = str(segment.get("command") or "").strip()
+            if not command:
+                command = str(normalize_queue_segment(segment, 1).get("command") or "").strip()
+            if segment_id and (project["id"], segment_id, command) in completed:
+                continue
+            if segment_id and ("", segment_id, command) in completed:
+                continue
+            prepared = dict(segment)
+            prepared["project_id"] = project["id"]
+            prepared["project_name"] = project["name"]
+            prepared["download_dir"] = str(
+                project_output_root(project["id"], base_output_root) / sanitize_filename(str(segment.get("name") or segment_id or "task"))
+            )
+            global_segments.append(prepared)
+    return {"version": 1, "segments": global_segments}
+
+
+def normalize_model_version(value: Any) -> str:
+    model = str(value or "").strip()
+    legacy_map = {
+        "seedance1.0fast": "seedance2.0fast",
+        "seedance1.0": "seedance2.0",
+        "seedance1.0fast_vip": "seedance2.0fast_vip",
+        "seedance1.0_vip": "seedance2.0_vip",
+    }
+    return legacy_map.get(model, model)
+
+
+def media_ref_aliases(path: str) -> set[str]:
+    file_path = Path(str(path or ""))
+    aliases = {file_path.stem, file_path.name}
+    # Uploaded files are often prefixed with timestamp/uuid before the user renames them.
+    cleaned = re.sub(r"^\d+-[0-9a-fA-F]{8}-", "", file_path.stem)
+    aliases.add(cleaned)
+    aliases.add(Path(cleaned).stem)
+    return {alias for alias in aliases if alias}
+
+
+def build_media_ref_map(images: list[str], videos: list[str], audios: list[str]) -> dict[tuple[str, str], str]:
+    mapping: dict[tuple[str, str], str] = {}
+    groups = [
+        ("Image", "图片", images),
+        ("Video", "视频", videos),
+        ("Audio", "音频", audios),
+    ]
+    for kind, label, paths in groups:
+        for index, path in enumerate(paths, start=1):
+            ref_label = f"{label}{index}"
+            for alias in media_ref_aliases(path):
+                mapping[(kind, alias)] = ref_label
+    return mapping
+
+
+def media_paths_for_prompt_refs(paths: list[str], prompt: str, kind: str) -> list[str]:
+    refs = re.findall(rf"@{kind}([^\s,，。、@]+)", str(prompt or ""))
+    if not refs:
+        return paths
+
+    selected: list[str] = []
+    for ref in refs:
+        best_path = ""
+        best_alias = ""
+        for path in paths:
+            for alias in media_ref_aliases(path):
+                if ref == alias or ref.startswith(alias):
+                    if len(alias) > len(best_alias):
+                        best_alias = alias
+                        best_path = path
+        if best_path and best_path not in selected:
+            selected.append(best_path)
+    return selected
+
+
+def filter_media_by_prompt_refs(
+    prompt: str,
+    images: list[str],
+    videos: list[str],
+    audios: list[str],
+) -> tuple[list[str], list[str], list[str]]:
+    return (
+        media_paths_for_prompt_refs(images, prompt, "Image"),
+        media_paths_for_prompt_refs(videos, prompt, "Video"),
+        media_paths_for_prompt_refs(audios, prompt, "Audio"),
+    )
+
+
+def normalize_prompt_text(prompt: str, media_refs: dict[tuple[str, str], str] | None = None) -> str:
+    text = str(prompt or "").strip()
+    if not text:
+        return ""
+
+    labels = {"Image": "图片", "Video": "视频", "Audio": "音频"}
+
+    def replace_named(match: re.Match[str]) -> str:
+        kind = match.group(1)
+        name = match.group(2)
+        if media_refs:
+            exact = media_refs.get((kind, name))
+            if exact:
+                return exact
+            prefix_matches = [
+                (alias, label)
+                for (ref_kind, alias), label in media_refs.items()
+                if ref_kind == kind and name.startswith(alias)
+            ]
+            if prefix_matches:
+                alias, label = max(prefix_matches, key=lambda item: len(item[0]))
+                return f"{label}{name[len(alias):]}"
+        return name
+
+    text = re.sub(r"@(Image|Video|Audio)([^\s,，。、@]+)", replace_named, text)
+    for kind, label in labels.items():
+        text = re.sub(rf"@{kind}\b", f"{label}参考", text)
+    return text
 
 
 def build_multiframe_command(images: list[str], prompt: str, duration: str, transition_prompts: list[str] | None = None) -> list[str]:
@@ -356,46 +802,36 @@ def build_multimodal_command(payload: dict[str, Any]) -> str:
     images = parse_line_values(payload.get("images"))
     videos = parse_line_values(payload.get("videos"))
     audios = parse_line_values(payload.get("audios"))
+    raw_prompt = str(payload.get("prompt") or "").strip()
+    images, videos, audios = filter_media_by_prompt_refs(raw_prompt, images, videos, audios)
 
     if not images and not videos and not audios:
         raise ValueError("至少要有一个图片、视频或音频素材。")
     if not images and not videos:
         raise ValueError("全能参考至少要有图片或视频，不能只放音频。")
 
-    prompt = normalize_prompt_text(str(payload.get("prompt") or "").strip())
-    transition_prompts = [normalize_prompt_text(item) for item in parse_line_values(payload.get("transition_prompts"))]
+    media_refs = build_media_ref_map(images, videos, audios)
+    prompt = normalize_prompt_text(raw_prompt, media_refs)
+    transition_prompts = [normalize_prompt_text(item, media_refs) for item in parse_line_values(payload.get("transition_prompts"))]
     duration = str(payload.get("duration") or "").strip()
     ratio = str(payload.get("ratio") or "").strip()
-    model_version = str(payload.get("model_version") or "").strip()
-    if videos or audios:
-        command = ["multimodal2video"]
-        for path in images:
-            command.extend(["--image", path])
-        for path in videos:
-            command.extend(["--video", path])
-        for path in audios:
-            command.extend(["--audio", path])
-        if prompt:
-            command.extend(["--prompt", prompt])
-        if duration:
-            command.extend(["--duration", duration])
-        if ratio:
-            command.extend(["--ratio", ratio])
-        if model_version:
-            command.extend(["--model_version", model_version])
-        return shlex.join(command)
-
-    if len(images) == 1:
-        command = ["image2video", "--image", images[0]]
-        if prompt:
-            command.extend(["--prompt", prompt])
-        if duration:
-            command.extend(["--duration", duration])
-        if model_version:
-            command.extend(["--model_version", model_version])
-        return shlex.join(command)
-
-    return shlex.join(build_multiframe_command(images, prompt, duration, transition_prompts))
+    model_version = normalize_model_version(payload.get("model_version"))
+    command = ["multimodal2video"]
+    for path in images:
+        command.extend(["--image", path])
+    for path in videos:
+        command.extend(["--video", path])
+    for path in audios:
+        command.extend(["--audio", path])
+    if prompt:
+        command.extend(["--prompt", prompt])
+    if duration:
+        command.extend(["--duration", duration])
+    if ratio:
+        command.extend(["--ratio", ratio])
+    if model_version:
+        command.extend(["--model_version", model_version])
+    return shlex.join(command)
 
 
 def build_text2video_command(payload: dict[str, Any]) -> str:
@@ -406,7 +842,7 @@ def build_text2video_command(payload: dict[str, Any]) -> str:
     command = ["text2video", "--prompt", prompt]
     duration = str(payload.get("duration") or "").strip()
     ratio = str(payload.get("ratio") or "").strip()
-    model_version = str(payload.get("model_version") or "").strip()
+    model_version = normalize_model_version(payload.get("model_version"))
     if duration:
         command.extend(["--duration", duration])
     if ratio:
@@ -414,19 +850,6 @@ def build_text2video_command(payload: dict[str, Any]) -> str:
     if model_version:
         command.extend(["--model_version", model_version])
     return shlex.join(command)
-
-
-def normalize_prompt_text(prompt: str) -> str:
-    text = str(prompt or "").strip()
-    if not text:
-        return ""
-    text = re.sub(r"@Image([^\s,，。、@]+)", r"\1", text)
-    text = re.sub(r"@Video([^\s,，。、@]+)", r"\1", text)
-    text = re.sub(r"@Audio([^\s,，。、@]+)", r"\1", text)
-    text = re.sub(r"@Image\b", "图片参考", text)
-    text = re.sub(r"@Video\b", "视频参考", text)
-    text = re.sub(r"@Audio\b", "音频参考", text)
-    return text
 
 
 def parse_multipart_parts(handler: BaseHTTPRequestHandler) -> list[dict[str, Any]]:
@@ -471,11 +894,17 @@ def parse_multipart_parts(handler: BaseHTTPRequestHandler) -> list[dict[str, Any
 def save_uploaded_files(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
     parts = parse_multipart_parts(handler)
     kind = "misc"
+    project_id = ""
     for part in parts:
         if part["name"] == "kind":
             kind = part["body"].decode("utf-8", errors="replace").strip().lower() or "misc"
-            break
-    target_dir = UPLOAD_DIR / kind
+        if part["name"] == "project_id":
+            project_id = part["body"].decode("utf-8", errors="replace").strip()
+    if project_id:
+        set_active_project(project_id)
+        target_dir = project_upload_root(project_id) / kind
+    else:
+        target_dir = UPLOAD_DIR / kind
     ensure_dir(target_dir)
 
     file_parts = [part for part in parts if part["name"] == "files" and part.get("filename")]
@@ -490,7 +919,7 @@ def save_uploaded_files(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
         target = target_dir / final_name
         target.write_bytes(item["body"])
         saved_paths.append(str(target))
-    return {"kind": kind, "paths": saved_paths}
+    return {"kind": kind, "project_id": project_id, "paths": saved_paths}
 
 
 def build_upload_record(kind: str, path: Path) -> dict[str, Any]:
@@ -503,14 +932,21 @@ def build_upload_record(kind: str, path: Path) -> dict[str, Any]:
     }
 
 
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
 def resolve_upload_path(path_value: str) -> Path:
     if not path_value:
         raise ValueError("缺少素材路径。")
     candidate = Path(unquote(path_value)).expanduser().resolve()
-    try:
-        candidate.relative_to(UPLOAD_DIR.resolve())
-    except ValueError as exc:
-        raise ValueError("只能操作上传目录里的素材。") from exc
+    allowed_roots = [UPLOAD_DIR.resolve(), PROJECTS_DIR.resolve()]
+    if not any(_is_relative_to(candidate, root) for root in allowed_roots):
+        raise ValueError("只能操作上传目录里的素材。")
     if not candidate.exists() or not candidate.is_file():
         raise ValueError("素材文件不存在。")
     return candidate
@@ -552,17 +988,191 @@ def parse_body(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
     raise ValueError(f"Unsupported Content-Type: {content_type}")
 
 
+# ========== 抖音采集相关函数 ==========
+
+def load_douyin_accounts() -> list[dict[str, Any]]:
+    """加载抖音账号列表"""
+    return load_json(DOUYIN_ACCOUNTS_FILE, [])
+
+
+def save_douyin_accounts(accounts: list[dict[str, Any]]) -> None:
+    """保存抖音账号列表"""
+    save_json(DOUYIN_ACCOUNTS_FILE, accounts)
+
+
+def load_douyin_status() -> dict[str, Any]:
+    """加载抖音下载状态"""
+    return load_json(DOUYIN_STATUS_FILE, {
+        "is_running": False,
+        "accounts": [],
+        "logs": []
+    })
+
+
+def save_douyin_status(status: dict[str, Any]) -> None:
+    """保存抖音下载状态"""
+    save_json(DOUYIN_STATUS_FILE, status)
+
+
+def add_douyin_log(level: str, message: str) -> None:
+    """添加抖音下载日志"""
+    global douyin_task
+    log_entry = {
+        "level": level,
+        "message": message,
+        "time": now_iso()
+    }
+    douyin_task["logs"].append(log_entry)
+    # 只保留最近100条日志
+    if len(douyin_task["logs"]) > 100:
+        douyin_task["logs"] = douyin_task["logs"][-100:]
+
+
+def start_douyin_task(config: dict[str, Any]) -> dict[str, Any]:
+    """启动抖音下载任务"""
+    global douyin_task
+
+    if douyin_task["is_running"]:
+        return {"error": "下载任务已在运行中"}
+
+    try:
+        # 准备参数
+        accounts = config.get("accounts", [])
+        if not accounts:
+            return {"error": "没有可下载的账号"}
+
+        save_path = config.get("save_path", "./douyin_videos")
+        min_likes = config.get("min_likes", 1000)
+        organize_by_tag = config.get("organize_by_tag", True)
+        auto_next = config.get("auto_next", True)
+
+        add_douyin_log("info", f"启动下载任务，共 {len(accounts)} 个账号")
+
+        # 初始化账号状态
+        douyin_task["accounts_status"] = [
+            {"url": acc, "status": "pending", "progress": 0}
+            for acc in accounts
+        ]
+        douyin_task["is_running"] = True
+
+        # 定义回调函数
+        def progress_callback(account_index, status, progress, **kwargs):
+            """进度回调"""
+            if account_index < len(douyin_task["accounts_status"]):
+                douyin_task["accounts_status"][account_index]["status"] = status
+                douyin_task["accounts_status"][account_index]["progress"] = progress
+                douyin_task["accounts_status"][account_index].update(kwargs)
+
+        def log_callback(level, message):
+            """日志回调"""
+            add_douyin_log(level, message)
+
+        # 在后台线程中运行下载任务
+        def run_download():
+            try:
+                # 导入下载器类
+                sys.path.insert(0, str(ROOT / "douyin"))
+                from douyin_selenium import DouyinSeleniumDownloader
+
+                downloader = DouyinSeleniumDownloader(
+                    output_dir=save_path,
+                    organize_by_tag=organize_by_tag,
+                    progress_callback=progress_callback,
+                    log_callback=log_callback
+                )
+
+                # 保存下载器实例，以便停止
+                douyin_task["downloader"] = downloader
+
+                # 运行批量下载
+                downloader.run_batch(
+                    user_urls=accounts,
+                    scroll_times=10,
+                    min_likes=min_likes,
+                    auto_mode=auto_next
+                )
+
+                add_douyin_log("success", "所有下载任务已完成")
+
+            except Exception as e:
+                add_douyin_log("error", f"下载任务异常: {str(e)}")
+                import traceback
+                add_douyin_log("error", traceback.format_exc())
+            finally:
+                douyin_task["is_running"] = False
+                douyin_task["downloader"] = None
+
+        # 启动后台线程
+        thread = threading.Thread(target=run_download, daemon=True)
+        thread.start()
+        douyin_task["thread"] = thread
+
+        return {"message": "下载任务已启动"}
+
+    except Exception as e:
+        add_douyin_log("error", f"启动失败: {str(e)}")
+        douyin_task["is_running"] = False
+        return {"error": str(e)}
+
+
+def stop_douyin_task() -> dict[str, Any]:
+    """停止抖音下载任务"""
+    global douyin_task
+
+    if not douyin_task["is_running"]:
+        return {"message": "没有运行中的任务"}
+
+    try:
+        # 调用下载器的停止方法
+        downloader = douyin_task.get("downloader")
+        if downloader:
+            downloader.stop()
+
+        add_douyin_log("info", "下载任务已停止")
+
+        return {"message": "下载任务已停止"}
+
+    except Exception as e:
+        add_douyin_log("error", f"停止失败: {str(e)}")
+        return {"error": str(e)}
+
+
+def get_douyin_task_status() -> dict[str, Any]:
+    """获取抖音下载状态"""
+    global douyin_task
+
+    # 检查线程是否还在运行
+    if douyin_task["is_running"]:
+        thread = douyin_task["thread"]
+        if thread and not thread.is_alive():
+            # 线程已结束
+            douyin_task["is_running"] = False
+            douyin_task["thread"] = None
+            add_douyin_log("success", "所有下载任务已完成")
+
+    return {
+        "is_running": douyin_task["is_running"],
+        "accounts": douyin_task["accounts_status"],
+        "logs": douyin_task["logs"][-20:]  # 只返回最近20条日志
+    }
+
+
+# ========== 原有函数 ==========
+
 def build_status_payload() -> dict[str, Any]:
     ensure_dir(APP_DIR)
     runner = read_runner_meta()
     ui_config = load_ui_config()
-    queue_file = normalize_queue_file_path(runner.get("queue_file") or ui_config.get("queue_file"))
+    active_project = get_active_project(ui_config)
+    queue_file = project_queue_file(active_project["id"])
     output_root = Path(runner.get("output_root") or ui_config.get("output_root") or DEFAULT_OUTPUT_ROOT)
     state_file = Path(runner.get("state_file") or ui_config.get("state_file") or DEFAULT_STATE_FILE)
     state = load_json(state_file, {})
     detected_dreamina = detect_dreamina_path()
     return {
         "runner": runner,
+        "projects": projects_for_payload(state, output_root),
+        "active_project": active_project,
         "queue_file": str(queue_file),
         "output_root": str(output_root),
         "state_file": str(state_file),
@@ -593,6 +1203,7 @@ def persist_runtime_form(payload: dict[str, Any], dreamina: str | None = None) -
             "timeout_seconds": int(payload.get("timeout_seconds") or 10800),
             "resume": bool_value(payload.get("resume")),
             "stop_on_failure": bool_value(payload.get("stop_on_failure")),
+            "active_project_id": str(payload.get("project_id") or "").strip() or None,
         }
     )
 
@@ -604,7 +1215,10 @@ def start_queue(payload: dict[str, Any]) -> dict[str, Any]:
             raise RuntimeError("当前已经有队列在运行。")
 
         ui_config = load_ui_config()
-        queue_file = normalize_queue_file_path(payload.get("queue_file") or ui_config.get("queue_file")).expanduser().resolve()
+        project_id = str(payload.get("project_id") or ui_config.get("active_project_id") or "").strip()
+        active_project = set_active_project(project_id) if project_id else get_active_project(ui_config)
+        active_queue_file = project_queue_file(active_project["id"]).expanduser().resolve()
+        queue_file = GLOBAL_QUEUE_FILE.expanduser().resolve()
         output_root = Path(payload.get("output_root") or ui_config.get("output_root") or DEFAULT_OUTPUT_ROOT).expanduser().resolve()
         state_file = Path(payload.get("state_file") or ui_config.get("state_file") or output_root / "queue-state.json").expanduser().resolve()
         requested_dreamina = str(payload.get("dreamina") or ui_config.get("dreamina") or "").strip()
@@ -623,7 +1237,12 @@ def start_queue(payload: dict[str, Any]) -> dict[str, Any]:
         ensure_dir(queue_file.parent)
         ensure_dir(output_root)
         ensure_dir(APP_DIR)
-        queue_file.write_text(queue_document_to_text(parse_queue_document(queue_content)), encoding="utf-8")
+        active_queue_file.write_text(queue_document_to_text(parse_queue_document(queue_content)), encoding="utf-8")
+        previous_state = load_json(state_file, {})
+        global_document = compose_global_queue_document(previous_state, output_root)
+        if not global_document.get("segments"):
+            raise ValueError("所有项目里都没有待执行任务。")
+        queue_file.write_text(queue_document_to_text(global_document), encoding="utf-8")
 
         if dreamina == "dreamina":
             resolved = shutil.which("dreamina")
@@ -646,6 +1265,7 @@ def start_queue(payload: dict[str, Any]) -> dict[str, Any]:
                 "timeout_seconds": timeout_seconds,
                 "resume": resume,
                 "stop_on_failure": stop_on_failure,
+                "project_id": active_project["id"],
             },
             dreamina=dreamina,
         )
@@ -689,6 +1309,8 @@ def start_queue(payload: dict[str, Any]) -> dict[str, Any]:
             "output_root": str(output_root),
             "state_file": str(state_file),
             "dreamina": dreamina,
+            "active_project_id": active_project["id"],
+            "active_project_name": active_project["name"],
             "command": command,
             "log_file": str(RUNNER_LOG_FILE),
         }
@@ -811,6 +1433,30 @@ HTML = """<!doctype html>
       grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: 12px;
       margin: 0 0 20px;
+    }
+    .project-bar {
+      display: grid;
+      grid-template-columns: minmax(260px, 1fr) auto;
+      gap: 14px;
+      align-items: end;
+      padding: 16px;
+      margin: 0 0 18px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: #fff;
+      box-shadow: 0 10px 24px rgba(23, 36, 34, 0.05);
+    }
+    .project-actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+    .project-meta {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 8px;
     }
     .step-card {
       display: flex;
@@ -974,7 +1620,8 @@ HTML = """<!doctype html>
       font-size: 12px;
       font-weight: 700;
     }
-    .pill.running { background: rgba(31,122,69,0.12); color: var(--ok); }
+    .pill.success { background: rgba(31,122,69,0.12); color: var(--ok); }
+    .pill.running { background: rgba(216,148,46,0.12); color: #b47814; }
     .pill.stopped { background: rgba(109,101,88,0.12); color: var(--muted); }
     .pill.failed { background: rgba(163,57,43,0.12); color: var(--danger); }
     table {
@@ -1004,6 +1651,11 @@ HTML = """<!doctype html>
       line-height: 1.55;
       font-family: var(--mono);
       min-height: 260px;
+      overflow: auto;
+    }
+    #logTail {
+      min-height: 180px;
+      max-height: 420px;
       overflow: auto;
     }
     .hint {
@@ -1384,7 +2036,8 @@ HTML = """<!doctype html>
       margin-bottom: 10px;
     }
     @media (max-width: 1080px) {
-      .grid, .app-steps { grid-template-columns: 1fr; }
+      .grid, .app-steps, .project-bar { grid-template-columns: 1fr; }
+      .project-actions { justify-content: flex-start; }
     }
     @media (max-width: 720px) {
       .fields, .stats, .subgrid, .subgrid.three { grid-template-columns: 1fr; }
@@ -1408,26 +2061,38 @@ HTML = """<!doctype html>
       <a class="nav-text2video" href="/text2video">文生视频</a>
     </nav>
 
+    <section class="project-bar" aria-label="项目管理">
+      <div>
+        <label for="projectSelect">当前项目</label>
+        <select id="projectSelect"></select>
+        <div class="project-meta" id="projectMeta"></div>
+      </div>
+      <div class="project-actions">
+        <button class="ghost" id="newProjectBtn" type="button">新建项目</button>
+        <button class="ghost" id="renameProjectBtn" type="button">重命名</button>
+      </div>
+    </section>
+
     <div class="app-steps">
       <div class="step-card">
         <strong>1</strong>
         <div>
-          <span>选择一种表单</span>
-          <p>纯文字用“文生视频”，带图片/视频/音频用“全能参考”。</p>
+          <span>选择项目</span>
+          <p>每个项目有独立的素材、任务和输出目录。</p>
         </div>
       </div>
       <div class="step-card">
         <strong>2</strong>
         <div>
-          <span>点加入队列</span>
-          <p>页面会自动拼好命令，不需要你手写 CLI 参数。</p>
+          <span>添加任务</span>
+          <p>纯文字用“文生视频”，带素材用“全能参考”。</p>
         </div>
       </div>
       <div class="step-card">
         <strong>3</strong>
         <div>
-          <span>启动后自动接力</span>
-          <p>上一个视频完成后，下一个任务会继续生成。</p>
+          <span>全局串行执行</span>
+          <p>所有项目的待执行任务会合并到一个队列里依次生成。</p>
         </div>
       </div>
     </div>
@@ -1486,7 +2151,7 @@ HTML = """<!doctype html>
 
           <div class="reference-page subcard">
             <h3>全能参考快速添加</h3>
-            <p class="hint" style="margin-top:0;">你不用自己拼命令。按表单填完，点“加入队列”即可。程序会按素材情况自动选择 `image2video`、`multiframe2video` 或 `multimodal2video`。在提示词任意位置输入 `@` 会出现已上传素材，选中后会自动把素材路径加入对应输入框。</p>
+            <p class="hint" style="margin-top:0;">你不用自己拼命令。这里固定使用即梦 CLI 的 `multimodal2video`，也就是“全能参考 / 参考生视频”。在提示词任意位置输入 `@` 会出现已上传素材，选中后会自动把素材路径加入对应输入框。</p>
 
 	            <label for="mmPrompt">提示词</label>
 	            <div style="margin-bottom:12px;">
@@ -1521,7 +2186,7 @@ HTML = """<!doctype html>
 	            <div style="margin-top:12px;">
 	              <label for="mmImages">图片素材路径</label>
 	              <textarea id="mmImages" style="min-height:90px;" spellcheck="false" placeholder="一行一个图片路径"></textarea>
-                <p class="hint" style="margin-top:6px;">多图时按顺序理解：第1张 → 第2张 → 第3张。想控制多图故事，请在下面的“多图过渡提示词”里一行写一个过渡。</p>
+                <p class="hint" style="margin-top:6px;">这些图片会作为全能参考素材通过 `--image` 传给即梦。不是只写进提示词里。</p>
 	              <div class="upload-row">
 	                <input id="uploadImages" type="file" multiple accept="image/*">
 	                <button class="ghost" id="uploadImagesBtn">上传图片并填入</button>
@@ -1669,6 +2334,7 @@ HTML = """<!doctype html>
                 <thead>
                   <tr>
                     <th>#</th>
+                    <th>项目</th>
                     <th>片段名</th>
                     <th>状态</th>
                     <th>submit_id</th>
@@ -1687,6 +2353,7 @@ HTML = """<!doctype html>
                 <thead>
                   <tr>
                     <th>#</th>
+                    <th>项目</th>
                     <th>片段名</th>
                     <th>状态</th>
                     <th>submit_id</th>
@@ -1739,6 +2406,8 @@ HTML = """<!doctype html>
 
   <script>
     const $ = (id) => document.getElementById(id);
+    let activeProjectId = "";
+    let allProjects = [];
 
     function setupPageMode() {
       const page = window.location.pathname === "/text2video" ? "text2video" : "reference";
@@ -1786,17 +2455,46 @@ HTML = """<!doctype html>
       pendingBody.innerHTML = "";
       completedBody.innerHTML = "";
 
-      const pendingTasks = (tasks || []).filter(task => !["success", "failed"].includes(task.status));
-      const completedTasks = (tasks || []).filter(task => ["success", "failed"].includes(task.status));
+      const terminalStatuses = ["success", "failed", "fail", "rejected", "banned", "error", "cancelled"];
+      
+      const pendingTasks = (tasks || []).filter(task => {
+        // 如果有明确的失败原因，它就是失败的，即使底层 JSON 写着 running
+        if (task.fail_reason) return false;
+        return !terminalStatuses.includes(task.status);
+      });
+      
+      const completedTasks = (tasks || []).filter(task => {
+        if (task.fail_reason) return true;
+        return terminalStatuses.includes(task.status);
+      });
 
       function appendRows(target, taskList) {
         for (const task of taskList) {
           const tr = document.createElement("tr");
-          const statusClass = task.status === "success" ? "running" : (task.status === "failed" ? "failed" : "stopped");
+          let statusClass = "stopped";
+          let displayStatus = task.status || "-";
+          
+          if (task.fail_reason) {
+            // 如果有失败原因，强制认定为失败状态，即使底层 JSON 写着 running
+            statusClass = "failed";
+            displayStatus = "failed";
+          } else if (task.status === "success") {
+            statusClass = "success";
+          } else if (["failed", "fail", "rejected", "banned", "error", "cancelled"].includes(task.status)) {
+            statusClass = "failed";
+          } else if (task.status === "running") {
+            statusClass = "running";
+          }
+
+          const failReason = task.fail_reason ? `<div class="hint" style="color:var(--danger);margin-top:4px;">${escapeHtml(task.fail_reason)}</div>` : "";
           tr.innerHTML = `
             <td>${task.index}</td>
+            <td>${escapeHtml(task.project_name || "-")}</td>
             <td>${escapeHtml(task.segment_name || "-")}</td>
-            <td><span class="pill ${statusClass}">${escapeHtml(task.status || "-")}</span></td>
+            <td>
+              <span class="pill ${statusClass}">${escapeHtml(displayStatus)}</span>
+              ${failReason}
+            </td>
             <td><code>${escapeHtml(task.submit_id || "-")}</code></td>
             <td><code>${escapeHtml(task.command || "")}</code></td>
           `;
@@ -1809,13 +2507,13 @@ HTML = """<!doctype html>
 
       if (!pendingTasks.length) {
         const tr = document.createElement("tr");
-        tr.innerHTML = `<td colspan="5" class="hint">当前没有待执行任务</td>`;
+        tr.innerHTML = `<td colspan="6" class="hint">当前没有待执行任务</td>`;
         pendingBody.appendChild(tr);
       }
 
       if (!completedTasks.length) {
         const tr = document.createElement("tr");
-        tr.innerHTML = `<td colspan="5" class="hint">当前还没有已完成任务</td>`;
+        tr.innerHTML = `<td colspan="6" class="hint">当前还没有已完成任务</td>`;
         completedBody.appendChild(tr);
       }
     }
@@ -1830,8 +2528,32 @@ HTML = """<!doctype html>
         timeout_seconds: Number($("timeoutSeconds").value || 10800),
         resume: $("resume").checked,
         stop_on_failure: $("stopOnFailure").checked,
+        project_id: activeProjectId,
         queue_content: $("queueContent").value
       };
+    }
+
+    function renderProjects(projects, activeProject) {
+      allProjects = projects || [];
+      activeProjectId = activeProject?.id || activeProjectId || allProjects[0]?.id || "";
+      const select = $("projectSelect");
+      select.innerHTML = "";
+      allProjects.forEach((project) => {
+        const option = document.createElement("option");
+        option.value = project.id;
+        const counts = project.counts || {};
+        option.textContent = `${project.name}（${counts.queued || 0} 条）`;
+        option.selected = project.id === activeProjectId;
+        select.appendChild(option);
+      });
+      const current = allProjects.find((project) => project.id === activeProjectId) || activeProject || {};
+      const counts = current.counts || {};
+      $("projectMeta").innerHTML = `
+        <span class="pill stopped">任务 ${counts.queued || 0}</span>
+        <span class="pill running">成功 ${counts.success || 0}</span>
+        <span class="pill failed">失败 ${counts.failed || 0}</span>
+        <span class="hint">${escapeHtml(current.output_root || "")}</span>
+      `;
     }
 
     async function refresh() {
@@ -1839,6 +2561,7 @@ HTML = """<!doctype html>
       const runner = data.runner || {};
       const state = data.state || {};
       const uiConfig = data.ui_config || {};
+      renderProjects(data.projects || [], data.active_project || null);
       const tasks = state.tasks || [];
       const successCount = tasks.filter(item => item.status === "success").length;
       const failCount = tasks.filter(item => item.status === "failed").length;
@@ -1890,6 +2613,7 @@ HTML = """<!doctype html>
       }
       const form = new FormData();
       form.append("kind", kind);
+      form.append("project_id", activeProjectId);
       for (const file of input.files) {
         form.append("files", file);
       }
@@ -2013,26 +2737,105 @@ HTML = """<!doctype html>
       return args.map(shellQuote).join(" ");
     }
 
-    function normalizePromptForCommand(prompt) {
+    function pathAliases(path) {
+      const name = String(path || "").split("/").pop() || "";
+      const stem = name.replace(/\\.[^.]+$/, "");
+      const cleaned = stem.replace(/^\\d+-[0-9a-fA-F]{8}-/, "");
+      return [name, stem, cleaned].filter(Boolean);
+    }
+
+    function mediaPathsForPromptRefs(paths, prompt, kind) {
+      const refs = [...String(prompt || "").matchAll(new RegExp(`@${kind}([^\\\\s,，。、@]+)`, "g"))].map((match) => match[1]);
+      if (!refs.length) return paths;
+      const selected = [];
+      refs.forEach((ref) => {
+        let bestPath = "";
+        let bestAlias = "";
+        paths.forEach((path) => {
+          pathAliases(path).forEach((alias) => {
+            if ((ref === alias || ref.startsWith(alias)) && alias.length > bestAlias.length) {
+              bestAlias = alias;
+              bestPath = path;
+            }
+          });
+        });
+        if (bestPath && !selected.includes(bestPath)) {
+          selected.push(bestPath);
+        }
+      });
+      return selected;
+    }
+
+    function filterSegmentMediaByPromptRefs(segment) {
+      return {
+        ...segment,
+        images: mediaPathsForPromptRefs(segment.images || [], segment.prompt, "Image"),
+        videos: mediaPathsForPromptRefs(segment.videos || [], segment.prompt, "Video"),
+        audios: mediaPathsForPromptRefs(segment.audios || [], segment.prompt, "Audio"),
+      };
+    }
+
+    function buildMediaRefMap(segment) {
+      const refs = new Map();
+      const groups = [
+        ["Image", "图片", segment.images || []],
+        ["Video", "视频", segment.videos || []],
+        ["Audio", "音频", segment.audios || []],
+      ];
+      groups.forEach(([kind, label, paths]) => {
+        paths.forEach((path, index) => {
+          pathAliases(path).forEach((alias) => refs.set(`${kind}:${alias}`, `${label}${index + 1}`));
+        });
+      });
+      return refs;
+    }
+
+    function normalizePromptForCommand(prompt, segment = null) {
+      const refs = segment ? buildMediaRefMap(segment) : new Map();
       return String(prompt || "")
         .trim()
-        .replace(/@Image([^\\s,，。、@]+)/g, "$1")
-        .replace(/@Video([^\\s,，。、@]+)/g, "$1")
-        .replace(/@Audio([^\\s,，。、@]+)/g, "$1")
+        .replace(/@(Image|Video|Audio)([^\\s,，。、@]+)/g, (_, kind, name) => {
+          const exact = refs.get(`${kind}:${name}`);
+          if (exact) return exact;
+          let bestAlias = "";
+          let bestLabel = "";
+          for (const [key, label] of refs.entries()) {
+            const prefix = `${kind}:`;
+            if (!key.startsWith(prefix)) continue;
+            const alias = key.slice(prefix.length);
+            if (name.startsWith(alias) && alias.length > bestAlias.length) {
+              bestAlias = alias;
+              bestLabel = label;
+            }
+          }
+          return bestAlias ? `${bestLabel}${name.slice(bestAlias.length)}` : name;
+        })
         .replace(/@Image\b/g, "图片参考")
         .replace(/@Video\b/g, "视频参考")
         .replace(/@Audio\b/g, "音频参考");
     }
 
+    function normalizeModelVersion(model) {
+      const value = String(model || "").trim();
+      return {
+        "seedance1.0fast": "seedance2.0fast",
+        "seedance1.0": "seedance2.0",
+        "seedance1.0fast_vip": "seedance2.0fast_vip",
+        "seedance1.0_vip": "seedance2.0_vip",
+      }[value] || value;
+    }
+
     function appendCommonArgs(command, segment, includeRatio) {
       if (segment.duration) command.push("--duration", segment.duration);
       if (includeRatio && segment.ratio) command.push("--ratio", segment.ratio);
-      if (segment.model_version) command.push("--model_version", segment.model_version);
+      const modelVersion = normalizeModelVersion(segment.model_version);
+      if (modelVersion) command.push("--model_version", modelVersion);
       return command;
     }
 
     function buildCommandFromSegment(segment) {
-      const prompt = normalizePromptForCommand(segment.prompt);
+      segment = filterSegmentMediaByPromptRefs(segment);
+      const prompt = normalizePromptForCommand(segment.prompt, segment);
       const mode = segment.mode || (!segment.images.length && !segment.videos.length && !segment.audios.length ? "text2video" : "");
       if (mode === "text2video") {
         if (!prompt) return "";
@@ -2040,36 +2843,13 @@ HTML = """<!doctype html>
         return joinCommand(appendCommonArgs(command, segment, true));
       }
 
-      if (segment.videos.length || segment.audios.length) {
+      if (segment.mode === "multimodal2video" || segment.images.length || segment.videos.length || segment.audios.length) {
         const command = ["multimodal2video"];
         segment.images.forEach((path) => command.push("--image", path));
         segment.videos.forEach((path) => command.push("--video", path));
         segment.audios.forEach((path) => command.push("--audio", path));
         if (prompt) command.push("--prompt", prompt);
         return joinCommand(appendCommonArgs(command, segment, true));
-      }
-
-      if (segment.images.length === 1) {
-        const command = ["image2video", "--image", segment.images[0]];
-        if (prompt) command.push("--prompt", prompt);
-        return joinCommand(appendCommonArgs(command, segment, false));
-      }
-
-      if (segment.images.length > 1) {
-        const command = ["multiframe2video", "--images", segment.images.join(",")];
-        const transitions = segment.transition_prompts.map(normalizePromptForCommand).filter(Boolean);
-        if (segment.images.length === 2) {
-          if (prompt) command.push("--prompt", prompt);
-          if (segment.duration) command.push("--duration", segment.duration);
-          return joinCommand(command);
-        }
-        const transitionCount = segment.images.length - 1;
-        const fallback = prompt || "保持角色与场景连贯，自然过渡到下一帧";
-        for (let i = 0; i < transitionCount; i += 1) {
-          command.push("--transition-prompt", transitions[i] || fallback);
-        }
-        if (segment.duration) command.push("--duration", segment.duration);
-        return joinCommand(command);
       }
 
       return "";
@@ -2195,15 +2975,23 @@ HTML = """<!doctype html>
 
     function buildQueueSegmentFromForm() {
       const payload = collectMultimodalPayload();
+      const draft = filterSegmentMediaByPromptRefs({
+        prompt: payload.prompt,
+        images: listFromTextarea("mmImages"),
+        transition_prompts: listFromTextarea("mmTransitions"),
+        videos: listFromTextarea("mmVideos"),
+        audios: listFromTextarea("mmAudios"),
+      });
       return normalizeSegment(
         {
           id: queueItemId(),
           name: $("mmSegmentName").value.trim() || `片段${Date.now()}`,
+          mode: "multimodal2video",
           prompt: payload.prompt,
-          images: listFromTextarea("mmImages"),
+          images: draft.images,
           transition_prompts: listFromTextarea("mmTransitions"),
-          videos: listFromTextarea("mmVideos"),
-          audios: listFromTextarea("mmAudios"),
+          videos: draft.videos,
+          audios: draft.audios,
           duration: payload.duration,
           ratio: payload.ratio,
           model_version: payload.model_version,
@@ -2379,7 +3167,20 @@ HTML = """<!doctype html>
         return;
       }
 
-      segments.forEach((segment, index) => {
+      segments.forEach((rawSegment, index) => {
+        const segment = normalizeSegment({
+          ...rawSegment,
+          mode: rawSegment.mode || ((rawSegment.images?.length || rawSegment.videos?.length || rawSegment.audios?.length) ? "multimodal2video" : ""),
+        }, index + 1);
+        const filteredSegment = filterSegmentMediaByPromptRefs(segment);
+        segment.images = filteredSegment.images;
+        segment.videos = filteredSegment.videos;
+        segment.audios = filteredSegment.audios;
+        if (segment.mode === "multimodal2video" || segment.images.length || segment.videos.length || segment.audios.length) {
+          segment.mode = "multimodal2video";
+          segment.command = buildCommandFromSegment(segment);
+        }
+        documentData.segments[index] = segment;
         const card = document.createElement("div");
         card.className = "queue-item";
         card.dataset.segmentId = segment.id;
@@ -2662,8 +3463,6 @@ HTML = """<!doctype html>
       const nextPos = info.start + choice.token.length;
       restoreTextareaState(textarea, getTextareaState(textarea), nextPos);
       hideAutocomplete();
-
-      // 自动将素材路径添加到对应的表单字段
       if (choice.path && choice.type) {
         const fieldId = materialFieldId(choice.type);
         if (fieldId) {
@@ -2872,6 +3671,7 @@ HTML = """<!doctype html>
     async function uploadBlobs(kind, files, textareaId) {
       const form = new FormData();
       form.append("kind", kind);
+      form.append("project_id", activeProjectId);
       for (const file of files) {
         form.append("files", file);
       }
@@ -2917,6 +3717,55 @@ HTML = """<!doctype html>
       alert("队列已保存");
     }
 
+    async function saveCurrentQueueSilentlyBeforeProjectChange() {
+      if (!activeProjectId) return;
+      syncQueueContentFromList();
+      await api("/api/save_queue", {
+        method: "POST",
+        body: JSON.stringify(collectPayload())
+      });
+      queueEditorDirty = false;
+    }
+
+    async function switchProject(projectId) {
+      if (!projectId || projectId === activeProjectId) return;
+      await saveCurrentQueueSilentlyBeforeProjectChange();
+      await api("/api/projects/select", {
+        method: "POST",
+        body: JSON.stringify({ project_id: projectId })
+      });
+      activeProjectId = projectId;
+      queueEditorDirty = false;
+      await refresh();
+      await loadMaterials();
+    }
+
+    async function createProjectFromPrompt() {
+      const name = window.prompt("项目名称", "新项目");
+      if (name === null) return;
+      await saveCurrentQueueSilentlyBeforeProjectChange();
+      const data = await api("/api/projects/create", {
+        method: "POST",
+        body: JSON.stringify({ name })
+      });
+      activeProjectId = data.project?.id || activeProjectId;
+      queueEditorDirty = false;
+      await refresh();
+      await loadMaterials();
+    }
+
+    async function renameCurrentProject() {
+      const current = allProjects.find((project) => project.id === activeProjectId);
+      if (!current) return;
+      const name = window.prompt("新的项目名称", current.name || "");
+      if (name === null) return;
+      await api("/api/projects/rename", {
+        method: "POST",
+        body: JSON.stringify({ project_id: activeProjectId, name })
+      });
+      await refresh();
+    }
+
     async function startQueue() {
       syncQueueContentFromList();
       await api("/api/start", {
@@ -2950,13 +3799,17 @@ HTML = """<!doctype html>
           poll_interval: Number($("pollInterval").value || 30),
           timeout_seconds: Number($("timeoutSeconds").value || 10800),
           resume: $("resume").checked,
-          stop_on_failure: $("stopOnFailure").checked
+          stop_on_failure: $("stopOnFailure").checked,
+          project_id: activeProjectId
         })
       });
       alert(`已检测到 dreamina：\\n${data.detected_dreamina}`);
     }
 
     $("detectBtn").addEventListener("click", () => detectDreamina().catch(err => alert(err.message)));
+    $("projectSelect").addEventListener("change", (event) => switchProject(event.target.value).catch(err => alert(err.message)));
+    $("newProjectBtn").addEventListener("click", () => createProjectFromPrompt().catch(err => alert(err.message)));
+    $("renameProjectBtn").addEventListener("click", () => renameCurrentProject().catch(err => alert(err.message)));
     $("saveBtn").addEventListener("click", () => saveQueue().catch(err => alert(err.message)));
     $("startBtn").addEventListener("click", () => startQueue().catch(err => alert(err.message)));
     $("stopBtn").addEventListener("click", () => stopQueue().catch(err => alert(err.message)));
@@ -3027,7 +3880,8 @@ HTML = """<!doctype html>
 
     async function loadMaterials() {
       try {
-        const res = await api('/api/uploads_list');
+        const query = activeProjectId ? `?project_id=${encodeURIComponent(activeProjectId)}` : "";
+        const res = await api('/api/uploads_list' + query);
         allMaterials = res.uploads || [];
         renderMaterials();
         renderRefs();
@@ -3170,6 +4024,21 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path in {"/", "/text2video"}:
             self._send_html(HTML)
             return
+        if parsed.path == "/douyin":
+            html_file = Path(__file__).parent / ".webui" / "douyin_collector.html"
+            if html_file.exists():
+                self._send_html(html_file.read_text(encoding="utf-8"))
+            else:
+                self._send_json({"error": "抖音采集页面不存在"}, status=404)
+            return
+        if parsed.path == "/api/douyin/accounts":
+            accounts = load_douyin_accounts()
+            self._send_json({"ok": True, "accounts": accounts})
+            return
+        if parsed.path == "/api/douyin/status":
+            status = get_douyin_task_status()
+            self._send_json({"ok": True, **status})
+            return
         if parsed.path == "/api/status":
             self._send_json(build_status_payload())
             return
@@ -3192,15 +4061,24 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(content)
             return
         if parsed.path == "/api/uploads_list":
+            query = parse_qs(parsed.query)
+            requested_project_id = query.get("project_id", [""])[-1]
+            active_project = set_active_project(requested_project_id) if requested_project_id else get_active_project()
             uploads = []
+            roots = [project_upload_root(active_project["id"])]
+            if active_project["name"] == "默认项目":
+                roots.append(UPLOAD_DIR)
             for kind in ["image", "video", "audio"]:
-                dir_path = UPLOAD_DIR / kind
-                if dir_path.is_dir():
-                    for f in sorted(dir_path.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
-                        if f.name.startswith("."):
-                            continue
-                        uploads.append(build_upload_record(kind, f))
-            self._send_json({"uploads": uploads})
+                dirs = [root / kind for root in roots]
+                files: list[Path] = []
+                for dir_path in dirs:
+                    if dir_path.is_dir():
+                        files.extend([f for f in dir_path.iterdir() if f.is_file()])
+                for f in sorted(files, key=lambda p: p.stat().st_mtime, reverse=True):
+                    if f.name.startswith("."):
+                        continue
+                    uploads.append(build_upload_record(kind, f))
+            self._send_json({"uploads": uploads, "project_id": active_project["id"]})
             return
         self._send_json({"error": "Not Found"}, status=404)
     def do_POST(self) -> None:
@@ -3212,6 +4090,23 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             payload = parse_body(self)
+            if parsed.path == "/api/projects/create":
+                project = create_project(str(payload.get("name") or "新项目"))
+                projects = load_projects()
+                if not any(item["id"] == project["id"] for item in projects):
+                    projects.append(project)
+                save_projects_index(projects)
+                set_active_project(project["id"])
+                self._send_json({"ok": True, "project": project, "projects": load_projects()})
+                return
+            if parsed.path == "/api/projects/select":
+                project = set_active_project(str(payload.get("project_id") or "").strip())
+                self._send_json({"ok": True, "project": project, "projects": load_projects()})
+                return
+            if parsed.path == "/api/projects/rename":
+                project = rename_project(str(payload.get("project_id") or "").strip(), str(payload.get("name") or "").strip())
+                self._send_json({"ok": True, "project": project, "projects": load_projects()})
+                return
             if parsed.path == "/api/start":
                 meta = start_queue(payload)
                 self._send_json({"ok": True, "runner": meta})
@@ -3237,11 +4132,26 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"ok": True, "runner": meta})
                 return
             if parsed.path == "/api/save_queue":
-                queue_file = normalize_queue_file_path(payload.get("queue_file")).expanduser().resolve()
+                project_id = str(payload.get("project_id") or load_ui_config().get("active_project_id") or "").strip()
+                active_project = set_active_project(project_id) if project_id else get_active_project()
+                queue_file = project_queue_file(active_project["id"]).expanduser().resolve()
                 ensure_dir(queue_file.parent)
                 normalized = queue_document_to_text(parse_queue_document(str(payload.get("queue_content", ""))))
                 queue_file.write_text(normalized, encoding="utf-8")
-                self._send_json({"ok": True, "queue_file": str(queue_file)})
+                self._send_json({"ok": True, "queue_file": str(queue_file), "project": active_project})
+                return
+            if parsed.path == "/api/douyin/accounts/save":
+                accounts = payload.get("accounts", [])
+                save_douyin_accounts(accounts)
+                self._send_json({"ok": True, "accounts": accounts})
+                return
+            if parsed.path == "/api/douyin/start":
+                result = start_douyin_task(payload)
+                self._send_json({"ok": True, **result})
+                return
+            if parsed.path == "/api/douyin/stop":
+                result = stop_douyin_task()
+                self._send_json({"ok": True, **result})
                 return
             self._send_json({"error": "Not Found"}, status=404)
         except Exception as exc:

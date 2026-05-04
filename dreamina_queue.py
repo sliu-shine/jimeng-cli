@@ -17,9 +17,9 @@ from pathlib import Path
 from typing import Any
 
 
-TERMINAL_STATUSES = {"success", "fail", "failed"}
+TERMINAL_STATUSES = {"success", "fail", "failed", "rejected", "banned", "error", "cancelled"}
 SUCCESS_STATUSES = {"success"}
-FAIL_STATUSES = {"fail", "failed"}
+FAIL_STATUSES = {"fail", "failed", "rejected", "banned", "error", "cancelled"}
 SUBMIT_ID_PATTERNS = [
     re.compile(r'"submit_id"\s*:\s*"([^"]+)"'),
     re.compile(r"\bsubmit_id\b\s*[:=]\s*([A-Za-z0-9_-]+)"),
@@ -40,6 +40,18 @@ RETRYABLE_FAILURE_MARKERS = (
     "generation failed",
     "final generation failed",
     "query_result 未返回 success",
+)
+NON_RETRYABLE_FAILURE_MARKERS = (
+    "post-tns check",
+    "audit",
+    "compliance",
+    "rejected",
+    "banned",
+    "sensitive",
+    "审核",
+    "confirmationrequired",
+    "compliance check",
+    "tns check",
 )
 TEXT_REFERENCE_MARKERS = ("提示词", "分镜", "脚本", "字幕", "台词", "prompt")
 SAFE_RETRY_MAX_IMAGES = 4
@@ -108,17 +120,102 @@ def read_queue_file(path: Path) -> list[str]:
     return read_queue_commands_from_text(path.read_text(encoding="utf-8"))
 
 
-def normalize_prompt_text(prompt: str) -> str:
+def media_ref_aliases(path: str) -> set[str]:
+    file_path = Path(str(path or ""))
+    aliases = {file_path.stem, file_path.name}
+    cleaned = re.sub(r"^\d+-[0-9a-fA-F]{8}-", "", file_path.stem)
+    aliases.add(cleaned)
+    aliases.add(Path(cleaned).stem)
+    return {alias for alias in aliases if alias}
+
+
+def build_media_ref_map(images: list[str], videos: list[str], audios: list[str]) -> dict[tuple[str, str], str]:
+    mapping: dict[tuple[str, str], str] = {}
+    groups = [
+        ("Image", "图片", images),
+        ("Video", "视频", videos),
+        ("Audio", "音频", audios),
+    ]
+    for kind, label, paths in groups:
+        for index, path in enumerate(paths, start=1):
+            ref_label = f"{label}{index}"
+            for alias in media_ref_aliases(path):
+                mapping[(kind, alias)] = ref_label
+    return mapping
+
+
+def media_paths_for_prompt_refs(paths: list[str], prompt: str, kind: str) -> list[str]:
+    refs = re.findall(rf"@{kind}([^\s,，。、@]+)", str(prompt or ""))
+    if not refs:
+        return paths
+
+    selected: list[str] = []
+    for ref in refs:
+        best_path = ""
+        best_alias = ""
+        for path in paths:
+            for alias in media_ref_aliases(path):
+                if ref == alias or ref.startswith(alias):
+                    if len(alias) > len(best_alias):
+                        best_alias = alias
+                        best_path = path
+        if best_path and best_path not in selected:
+            selected.append(best_path)
+    return selected
+
+
+def filter_media_by_prompt_refs(
+    prompt: str,
+    images: list[str],
+    videos: list[str],
+    audios: list[str],
+) -> tuple[list[str], list[str], list[str]]:
+    return (
+        media_paths_for_prompt_refs(images, prompt, "Image"),
+        media_paths_for_prompt_refs(videos, prompt, "Video"),
+        media_paths_for_prompt_refs(audios, prompt, "Audio"),
+    )
+
+
+def normalize_prompt_text(prompt: str, media_refs: dict[tuple[str, str], str] | None = None) -> str:
     text = str(prompt or "").strip()
     if not text:
         return ""
-    text = re.sub(r"@Image([^\s,，。、@]+)", r"\1", text)
-    text = re.sub(r"@Video([^\s,，。、@]+)", r"\1", text)
-    text = re.sub(r"@Audio([^\s,，。、@]+)", r"\1", text)
-    text = re.sub(r"@Image\b", "图片参考", text)
-    text = re.sub(r"@Video\b", "视频参考", text)
-    text = re.sub(r"@Audio\b", "音频参考", text)
+
+    labels = {"Image": "图片", "Video": "视频", "Audio": "音频"}
+
+    def replace_named(match: re.Match[str]) -> str:
+        kind = match.group(1)
+        name = match.group(2)
+        if media_refs:
+            exact = media_refs.get((kind, name))
+            if exact:
+                return exact
+            prefix_matches = [
+                (alias, label)
+                for (ref_kind, alias), label in media_refs.items()
+                if ref_kind == kind and name.startswith(alias)
+            ]
+            if prefix_matches:
+                alias, label = max(prefix_matches, key=lambda item: len(item[0]))
+                return f"{label}{name[len(alias):]}"
+        return name
+
+    text = re.sub(r"@(Image|Video|Audio)([^\s,，。、@]+)", replace_named, text)
+    for kind, label in labels.items():
+        text = re.sub(rf"@{kind}\b", f"{label}参考", text)
     return text
+
+
+def normalize_model_version(value: Any) -> str:
+    model = str(value or "").strip()
+    legacy_map = {
+        "seedance1.0fast": "seedance2.0fast",
+        "seedance1.0": "seedance2.0",
+        "seedance1.0fast_vip": "seedance2.0fast_vip",
+        "seedance1.0_vip": "seedance2.0_vip",
+    }
+    return legacy_map.get(model, model)
 
 
 def build_multiframe_command(
@@ -161,41 +258,34 @@ def build_multimodal_command_from_segment(segment: dict[str, Any]) -> str:
     images = [str(path).strip() for path in segment.get("images") or [] if str(path).strip()]
     videos = [str(path).strip() for path in segment.get("videos") or [] if str(path).strip()]
     audios = [str(path).strip() for path in segment.get("audios") or [] if str(path).strip()]
-    prompt = normalize_prompt_text(str(segment.get("prompt") or "").strip())
-    transition_prompts = [normalize_prompt_text(str(item)) for item in segment.get("transition_prompts") or [] if str(item).strip()]
+    raw_prompt = str(segment.get("prompt") or "").strip()
+    images, videos, audios = filter_media_by_prompt_refs(raw_prompt, images, videos, audios)
+    media_refs = build_media_ref_map(images, videos, audios)
+    prompt = normalize_prompt_text(raw_prompt, media_refs)
+    transition_prompts = [normalize_prompt_text(str(item), media_refs) for item in segment.get("transition_prompts") or [] if str(item).strip()]
     duration = str(segment.get("duration") or "").strip()
     ratio = str(segment.get("ratio") or "").strip()
-    model_version = str(segment.get("model_version") or "").strip()
+    model_version = normalize_model_version(segment.get("model_version"))
 
-    if videos or audios:
-        command = ["multimodal2video"]
-        for path in images:
-            command.extend(["--image", path])
-        for path in videos:
-            command.extend(["--video", path])
-        for path in audios:
-            command.extend(["--audio", path])
-        if prompt:
-            command.extend(["--prompt", prompt])
-        if duration:
-            command.extend(["--duration", duration])
-        if ratio:
-            command.extend(["--ratio", ratio])
-        if model_version:
-            command.extend(["--model_version", model_version])
-        return shlex.join(command)
+    if not images and not videos:
+        raise SystemExit("全能参考至少要有图片或视频，不能只放音频。")
 
-    if len(images) == 1:
-        command = ["image2video", "--image", images[0]]
-        if prompt:
-            command.extend(["--prompt", prompt])
-        if duration:
-            command.extend(["--duration", duration])
-        if model_version:
-            command.extend(["--model_version", model_version])
-        return shlex.join(command)
-
-    return shlex.join(build_multiframe_command(images, prompt, duration, transition_prompts))
+    command = ["multimodal2video"]
+    for path in images:
+        command.extend(["--image", path])
+    for path in videos:
+        command.extend(["--video", path])
+    for path in audios:
+        command.extend(["--audio", path])
+    if prompt:
+        command.extend(["--prompt", prompt])
+    if duration:
+        command.extend(["--duration", duration])
+    if ratio:
+        command.extend(["--ratio", ratio])
+    if model_version:
+        command.extend(["--model_version", model_version])
+    return shlex.join(command)
 
 
 def build_text2video_command_from_segment(segment: dict[str, Any]) -> str:
@@ -206,7 +296,7 @@ def build_text2video_command_from_segment(segment: dict[str, Any]) -> str:
     command = ["text2video", "--prompt", prompt]
     duration = str(segment.get("duration") or "").strip()
     ratio = str(segment.get("ratio") or "").strip()
-    model_version = str(segment.get("model_version") or "").strip()
+    model_version = normalize_model_version(segment.get("model_version"))
     if duration:
         command.extend(["--duration", duration])
     if ratio:
@@ -349,6 +439,8 @@ def should_retry_with_safe_fallback(task: dict[str, Any], fail_reason: str | Non
     reason = str(fail_reason or "").strip().lower()
     if not reason:
         return False
+    if any(marker in reason for marker in NON_RETRYABLE_FAILURE_MARKERS):
+        return False
     return any(marker in reason for marker in RETRYABLE_FAILURE_MARKERS)
 
 
@@ -377,26 +469,37 @@ def normalize_queue_entry(item: Any, index: int) -> dict[str, Any]:
     name = str(entry.get("name") or f"片段{index}").strip() or f"片段{index}"
     mode = str(entry.get("mode") or entry.get("type") or "").strip()
     command = str(entry.get("command") or "").strip()
-    if not command:
-        for key in ["images", "transition_prompts", "videos", "audios"]:
-            value = entry.get(key)
-            if isinstance(value, list):
-                entry[key] = [str(part).strip() for part in value if str(part).strip()]
-            elif value is None:
-                entry[key] = []
-            else:
-                entry[key] = [line.strip() for line in str(value).splitlines() if line.strip()]
-        has_media = bool(entry.get("images") or entry.get("videos") or entry.get("audios"))
+    for key in ["images", "transition_prompts", "videos", "audios"]:
+        value = entry.get(key)
+        if isinstance(value, list):
+            entry[key] = [str(part).strip() for part in value if str(part).strip()]
+        elif value is None:
+            entry[key] = []
+        else:
+            entry[key] = [line.strip() for line in str(value).splitlines() if line.strip()]
+    has_media = bool(entry.get("images") or entry.get("videos") or entry.get("audios"))
+    structured_mode = mode in {"text2video", "multimodal2video", "reference", "multimodal"}
+    if not command or structured_mode or has_media:
         if mode == "text2video" or not has_media:
             mode = "text2video"
             command = build_text2video_command_from_segment(entry)
         else:
+            mode = "multimodal2video"
+            entry["images"], entry["videos"], entry["audios"] = filter_media_by_prompt_refs(
+                str(entry.get("prompt") or ""),
+                list(entry.get("images") or []),
+                list(entry.get("videos") or []),
+                list(entry.get("audios") or []),
+            )
             command = build_multimodal_command_from_segment(entry)
 
     return {
         "id": entry_id,
         "name": name,
         "mode": mode,
+        "project_id": str(entry.get("project_id") or ""),
+        "project_name": str(entry.get("project_name") or ""),
+        "download_dir": str(entry.get("download_dir") or ""),
         "command": command,
         "prompt": str(entry.get("prompt") or ""),
         "images": list(entry.get("images") or []),
@@ -521,6 +624,24 @@ def parse_command_output(text: str) -> dict[str, Any]:
     normalized_status = gen_status.lower() if isinstance(gen_status, str) else None
     normalized_reason = fail_reason.strip() if isinstance(fail_reason, str) else None
 
+    # 兜底逻辑：如果文本里明确说了 generation failed，即使没解析到状态，也认为失败
+    if not normalized_status or normalized_status not in TERMINAL_STATUSES:
+        lower_text = text.lower()
+        if "generation failed" in lower_text or "final generation failed" in lower_text:
+            normalized_status = "failed"
+            if not normalized_reason:
+                normalized_reason = "检测到文本输出中的生成失败标识"
+        elif any(marker in lower_text for marker in NON_RETRYABLE_FAILURE_MARKERS):
+            normalized_status = "failed"
+            if not normalized_reason:
+                # 提取具体的失败原因，比如 "post-TNS check did not pass"
+                for marker in NON_RETRYABLE_FAILURE_MARKERS:
+                    if marker in lower_text:
+                        normalized_reason = f"审核/合规拦截: {marker}"
+                        break
+                if not normalized_reason:
+                    normalized_reason = "检测到不可重试的失败标识（如审核未通过）"
+
     return {
         "submit_id": submit_id,
         "gen_status": normalized_status,
@@ -543,12 +664,17 @@ def build_task_records(entries: list[dict[str, Any]], output_root: Path) -> list
     for index, entry in enumerate(entries, start=1):
         command = str(entry["command"])
         segment_name = str(entry.get("name") or f"片段{index}")
+        project_id = str(entry.get("project_id") or "")
+        project_name = str(entry.get("project_name") or "")
         task_label = sanitize_name(f"{segment_name}-{command[:48]}")
+        download_dir = Path(str(entry.get("download_dir") or "")).expanduser() if entry.get("download_dir") else output_root / f"{index:03d}-{task_label}"
         tasks.append(
             {
                 "index": index,
                 "segment_id": str(entry.get("id") or f"legacy-{index}"),
                 "segment_name": segment_name,
+                "project_id": project_id,
+                "project_name": project_name,
                 "command": command,
                 "prompt": str(entry.get("prompt") or ""),
                 "images": list(entry.get("images") or []),
@@ -565,7 +691,7 @@ def build_task_records(entries: list[dict[str, Any]], output_root: Path) -> list
                 "fail_reason": None,
                 "started_at": None,
                 "finished_at": None,
-                "download_dir": str(output_root / f"{index:03d}-{task_label}"),
+                "download_dir": str(download_dir),
                 "submit_stdout": None,
                 "submit_stderr": None,
                 "final_stdout": None,
@@ -581,7 +707,13 @@ def build_task_records(entries: list[dict[str, Any]], output_root: Path) -> list
 
 
 def load_state(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
+    try:
+        content = path.read_text(encoding="utf-8").strip()
+        if not content:
+            return {}
+        return json.loads(content)
+    except (json.JSONDecodeError, UnicodeDecodeError, FileNotFoundError):
+        return {}
 
 
 def save_state(path: Path, state: dict[str, Any]) -> None:
@@ -593,8 +725,8 @@ def prepare_state(args: argparse.Namespace, entries: list[dict[str, Any]]) -> di
     output_root = args.output_root.resolve()
     if args.resume and args.state_file.exists():
         state = load_state(args.state_file)
-        existing_signatures = [(task.get("segment_id"), task["command"]) for task in state.get("tasks", [])]
-        current_signatures = [(entry.get("id"), entry["command"]) for entry in entries]
+        existing_signatures = [(task.get("project_id"), task.get("segment_id"), task["command"]) for task in state.get("tasks", [])]
+        current_signatures = [(entry.get("project_id"), entry.get("id"), entry["command"]) for entry in entries]
         if existing_signatures != current_signatures:
             raise SystemExit("`--resume` 使用的队列文件和已有 state 不一致，已拒绝继续。")
         return state
@@ -776,6 +908,13 @@ def apply_attempt_to_task(task: dict[str, Any], attempt: dict[str, Any], *, is_r
     task["urls"] = attempt["urls"]
     task["final_stdout"] = attempt["final_stdout"]
     task["final_stderr"] = attempt["final_stderr"]
+    
+    # 强制同步 status，确保不会出现 "running" 状态却有 "fail_reason" 的情况
+    if attempt.get("status"):
+        task["status"] = attempt["status"]
+    elif task["fail_reason"]:
+        task["status"] = "failed"
+
     if is_retry:
         task["retry_attempted"] = True
         task["retry_count"] = int(task.get("retry_count") or 0) + 1
@@ -805,65 +944,27 @@ def run_queue(args: argparse.Namespace) -> int:
         ensure_dir(task_log_dir)
         task["started_at"] = task.get("started_at") or now_iso()
         task["status"] = "running"
+        task["fail_reason"] = None
+        task["gen_status"] = "processing"
+        task["finished_at"] = None
         update_state(state_path, state)
         first_attempt = execute_task_attempt(args, task, task_log_dir, task["command"])
         apply_attempt_to_task(task, first_attempt)
-        update_state(state_path, state)
 
         final_attempt = first_attempt
-        if first_attempt["status"] != "success" and should_retry_with_safe_fallback(task, first_attempt.get("fail_reason")):
-            retry_plan: list[tuple[str, dict[str, Any] | None, str, str]] = [
-                (
-                    "首次失败，触发保守重试：缩短提示词、限制素材数量并去掉文本参考图后再试一次",
-                    build_safe_retry_entry(task),
-                    "retry-submit",
-                    "retry-query",
-                ),
-                (
-                    "保守重试仍失败，触发极简重试：只保留主参考图、压缩提示词并切到非 fast 模型",
-                    build_ultra_safe_retry_entry(task),
-                    "retry2-submit",
-                    "retry2-query",
-                ),
-            ]
-            for message, retry_entry, submit_prefix, query_prefix in retry_plan:
-                if final_attempt["status"] == "success":
-                    break
-                if not should_retry_with_safe_fallback(task, final_attempt.get("fail_reason")):
-                    break
-                if not retry_entry:
-                    continue
-                previous_commands = {task["command"], task.get("retry_command")}
-                if retry_entry["command"] in previous_commands:
-                    continue
-                log(f"任务 #{task['index']} {message}")
-                retry_attempt = execute_task_attempt(
-                    args,
-                    task,
-                    task_log_dir,
-                    retry_entry["command"],
-                    submit_prefix=submit_prefix,
-                    query_prefix=query_prefix,
-                )
-                apply_attempt_to_task(task, retry_attempt, is_retry=True)
-                update_state(state_path, state)
-                final_attempt = retry_attempt
-
+        task["status"] = final_attempt["status"]
         task["finished_at"] = now_iso()
+        update_state(state_path, state)
 
         if final_attempt["status"] == "success":
-            task["status"] = "success"
             if task.get("retry_attempted"):
                 log(
                     f"任务 #{task['index']} 保守重试后完成，submit_id={task.get('submit_id') or '-'}，已下载到 {task['download_dir']}"
                 )
             else:
                 log(f"任务 #{task['index']} 完成，submit_id={task.get('submit_id') or '-'}，已下载到 {task['download_dir']}")
-            update_state(state_path, state)
             continue
 
-        task["status"] = "failed"
-        update_state(state_path, state)
         log(f"任务 #{task['index']} 失败，submit_id={task.get('submit_id') or '-'}，原因: {task.get('fail_reason') or '-'}")
         if args.stop_on_failure:
             return 1
