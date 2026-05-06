@@ -33,6 +33,35 @@ class DouyinDownloader:
         if self.session:
             await self.session.close()
 
+    def _find_existing_video_file(self, video_id: str, save_dir: Path) -> Optional[Path]:
+        """按视频 ID 查找已下载的 mp4，避免同一视频重复下载"""
+        video_id = str(video_id)
+
+        for meta_file in self.output_dir.rglob("*.json"):
+            try:
+                with open(meta_file, "r", encoding="utf-8") as f:
+                    metadata = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+
+            existing_id = (
+                metadata.get("aweme_id")
+                or metadata.get("video_id")
+                or metadata.get("videoId")
+            )
+            if str(existing_id) != video_id:
+                continue
+
+            video_file = meta_file.with_suffix(".mp4")
+            if video_file.exists():
+                return video_file
+
+        for search_root in {self.output_dir, save_dir}:
+            for video_file in search_root.rglob(f"*{video_id}*.mp4"):
+                return video_file
+
+        return None
+
     def extract_sec_uid(self, user_url: str) -> Optional[str]:
         """从用户主页链接提取 sec_uid"""
         # 支持多种格式
@@ -47,7 +76,7 @@ class DouyinDownloader:
         self,
         sec_uid: str,
         max_count: int = 50,
-        min_likes: int = 100000
+        min_likes: int = 1000
     ) -> List[Dict[str, Any]]:
         """
         获取用户的视频列表
@@ -55,7 +84,7 @@ class DouyinDownloader:
         Args:
             sec_uid: 用户的 sec_uid
             max_count: 最多获取多少个视频
-            min_likes: 最低点赞数筛选（默认10万+）
+            min_likes: 最低点赞数筛选（默认 1000+）
 
         Returns:
             视频信息列表
@@ -169,6 +198,11 @@ class DouyinDownloader:
         aweme_id = video_info["aweme_id"]
         video_url = video_info["video_url"]
 
+        existing_video = self._find_existing_video_file(aweme_id, save_dir)
+        if existing_video:
+            print(f"视频已采集，跳过: {aweme_id} ({existing_video})")
+            return existing_video
+
         if not video_url:
             print(f"视频 {aweme_id} 没有下载链接")
             return None
@@ -212,7 +246,7 @@ class DouyinDownloader:
         self,
         user_url: str,
         max_count: int = 20,
-        min_likes: int = 100000
+        min_likes: int = 1000
     ) -> List[Path]:
         """
         下载用户的爆款视频
@@ -273,7 +307,7 @@ async def main():
         videos = await downloader.download_user_viral_videos(
             user_url=user_url,
             max_count=20,
-            min_likes=100000  # 10万点赞以上
+            min_likes=1000
         )
 
         print(f"\n下载完成，共 {len(videos)} 个视频")

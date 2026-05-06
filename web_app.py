@@ -370,8 +370,10 @@ def project_upload_root(project_id: str) -> Path:
 
 
 def project_output_root(project_id: str, base_output_root: Path | None = None) -> Path:
-    base = base_output_root or DEFAULT_OUTPUT_ROOT
-    return base / "projects" / project_folder_name(project_id)
+    # Keep generated videos with the project itself. The runner-level
+    # output_root is still used for global state/logs, but each task receives
+    # an explicit project-local download_dir.
+    return project_dir(project_id) / "outputs"
 
 
 def short_project_suffix(project_id: str) -> str:

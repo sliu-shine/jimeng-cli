@@ -18,7 +18,7 @@ class DouyinViralPipeline:
     def __init__(
         self,
         output_dir: str = "./douyin_analysis",
-        min_likes: int = 100000
+        min_likes: int = 1000
     ):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -205,7 +205,7 @@ async def main():
 
     pipeline = DouyinViralPipeline(
         output_dir="./douyin_analysis",
-        min_likes=100000  # 10万点赞以上
+        min_likes=1000
     )
 
     export_file = await pipeline.run_full_pipeline(

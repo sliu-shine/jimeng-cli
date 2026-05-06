@@ -1,22 +1,5 @@
 {
   "version": 1,
   "segments": [
-    {
-      "id": "8a85ec47-70ff-46e7-ba9a-b3f831cedd4e",
-      "name": "舞蹈视频",
-      "mode": "multimodal2video",
-      "prompt": "@Image舞蹈分镜图为故事板顺序参考。请按顺序观看这16个分镜， @Image舞蹈女主作为主角，来制作一个15秒的舞蹈短片。",
-      "command": "multimodal2video --image '/Users/sliu/web-project/rich-projects/jimeng-cli/.webui/uploads/image/舞蹈分镜图.png' --image '/Users/sliu/web-project/rich-projects/jimeng-cli/.webui/uploads/image/舞蹈女主.png' --prompt '图片1为故事板顺序参考。请按顺序观看这16个分镜， 图片2作为主角，来制作一个15秒的舞蹈短片。' --duration 15 --ratio 9:16 --model_version seedance2.0fast",
-      "images": [
-        "/Users/sliu/web-project/rich-projects/jimeng-cli/.webui/uploads/image/舞蹈分镜图.png",
-        "/Users/sliu/web-project/rich-projects/jimeng-cli/.webui/uploads/image/舞蹈女主.png"
-      ],
-      "transition_prompts": [],
-      "videos": [],
-      "audios": [],
-      "duration": "15",
-      "ratio": "9:16",
-      "model_version": "seedance2.0fast"
-    }
   ]
 }

@@ -352,29 +352,16 @@
                 title = meaningfulText.substring(0, 100) || `视频_${videoId}`;
             }
 
-            // 获取视频标签
+            // 获取视频标签：只从当前视频标题里的 #话题 提取，避免混入推荐/商品标签
             const tags = [];
-            const hashtagElements = videoElement.querySelectorAll('[href*="/search/"]') ||
-                                   videoElement.querySelectorAll('[class*="tag"]') ||
-                                   videoElement.querySelectorAll('[class*="topic"]');
-
-            hashtagElements.forEach(el => {
-                const tagText = el.textContent?.trim().replace(/^#/, '');
-                if (tagText && tagText.length > 0 && tagText.length < 30) {
-                    tags.push(tagText);
-                }
-            });
-
-            if (tags.length === 0) {
-                const hashtagMatches = title.match(/#([^\s#]+)/g);
-                if (hashtagMatches) {
-                    hashtagMatches.forEach(tag => {
-                        const cleanTag = tag.replace(/^#/, '');
-                        if (cleanTag.length > 0 && cleanTag.length < 30) {
-                            tags.push(cleanTag);
-                        }
-                    });
-                }
+            const hashtagMatches = title.match(/#([^\s#，,。！!？?、]+)/g);
+            if (hashtagMatches) {
+                hashtagMatches.forEach(tag => {
+                    const cleanTag = tag.replace(/^#/, '').trim();
+                    if (cleanTag.length > 0 && cleanTag.length < 30 && !tags.includes(cleanTag)) {
+                        tags.push(cleanTag);
+                    }
+                });
             }
 
             const desc = title.substring(0, 50) || videoId;

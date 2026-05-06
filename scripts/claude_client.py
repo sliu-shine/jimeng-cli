@@ -5,6 +5,7 @@ import os
 import json
 import httpx
 from typing import Optional
+from viral_agent.ai_providers import get_provider
 
 
 class ClaudeClient:
@@ -13,17 +14,20 @@ class ClaudeClient:
     def __init__(
         self,
         api_key: Optional[str] = None,
-        base_url: Optional[str] = None
+        base_url: Optional[str] = None,
+        provider_id: Optional[str] = None,
     ):
-        self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
-        self.base_url = base_url or os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
+        provider = None if api_key and base_url else get_provider(provider_id)
+        self.api_key = api_key or (provider.api_key if provider else os.getenv("ANTHROPIC_API_KEY"))
+        self.base_url = (base_url or (provider.base_url if provider else os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com"))).rstrip("/")
+        self.model = provider.model if provider else os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
         if not self.api_key:
             raise ValueError("需要提供 ANTHROPIC_API_KEY")
 
     def create_message(
         self,
-        model: str,
+        model: str | None,
         messages: list,
         max_tokens: int = 1024,
         temperature: float = 1.0,
@@ -39,7 +43,7 @@ class ClaudeClient:
         }
 
         payload = {
-            "model": model,
+            "model": model or self.model,
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature
@@ -62,8 +66,7 @@ def test_connection():
 
     try:
         client = ClaudeClient(
-            api_key="sk-8efdb67427cea88f1c3de7e9b592fa57e6c3521d7de0e7c75016ce52d55a4942",
-            base_url="https://v3.codesome.cn"
+            base_url=os.getenv("ANTHROPIC_BASE_URL", "https://v3.codesome.cn")
         )
 
         print(f"Base URL: {client.base_url}")

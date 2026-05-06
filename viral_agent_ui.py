@@ -6,29 +6,490 @@ import os
 import sys
 import json
 import asyncio
+import threading
+import time
+import re
+import uuid
 from pathlib import Path
+from typing import Optional
+from datetime import datetime
 
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent / "douyin"))
 
 import gradio as gr
 from viral_agent import knowledge_base as kb
 from viral_agent.analyzer import analyze_script
-from viral_agent.agent import generate
-from douyin_downloader.pipeline import DouyinViralPipeline
+from viral_agent.agent import format_generation_report, generate_detailed
+from viral_agent.ai_providers import apply_provider, get_provider, masked_key, provider_choices
+from viral_agent.seedance_prompt_builder import build_seedance_outputs
+from douyin.douyin_downloader.pipeline import DouyinViralPipeline
+from douyin.douyin_downloader.transcriber import extract_transcript
+from scripts.claude_client import ClaudeClient
+
+ROOT = Path(__file__).resolve().parent
+APP_DIR = ROOT / ".webui"
+DOUYIN_ACCOUNTS_FILE = APP_DIR / "douyin_accounts.json"
+GENERATED_SCRIPTS_FILE = APP_DIR / "generated_scripts.json"
+WEB_QUEUE_FILE = APP_DIR / "web.queue.json"
+PROJECTS_DIR = APP_DIR / "projects"
+PROJECTS_INDEX_FILE = APP_DIR / "projects.json"
+UI_CONFIG_FILE = APP_DIR / "ui-config.json"
 
 # ── 环境变量（可在界面顶部覆盖）──────────────────────────
+try:
+    DEFAULT_PROVIDER = apply_provider(os.environ.get("AI_PROVIDER_DEFAULT"))
+except Exception:
+    DEFAULT_PROVIDER = None
 DEFAULT_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 DEFAULT_BASE_URL = os.environ.get("ANTHROPIC_BASE_URL", "https://cc.codesome.ai")
+DEFAULT_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+DEFAULT_TRANSCRIBE_API_KEY = os.environ.get("YUNWU_API_KEY", "")
+TRANSCRIBABLE_SUFFIXES = {".mp4", ".m4a", ".mp3", ".aac", ".wav"}
+
+# ── 全局变量：Selenium 抖音采集任务状态 ──────────────────
+selenium_task = {
+    "is_running": False,
+    "thread": None,
+    "downloader": None,
+    "accounts_status": [],
+    "logs": [],
+    "current_account": 0,
+    "total_accounts": 0,
+    "active_account_indices": []
+}
 
 
-def set_env(api_key: str, base_url: str):
-    if api_key.strip():
+def set_env(api_key: str, base_url: str, model: str = "", provider_id: str = ""):
+    if provider_id:
+        try:
+            apply_provider(provider_id)
+        except Exception:
+            pass
+    if api_key and api_key.strip() and "..." not in api_key:
         os.environ["ANTHROPIC_API_KEY"] = api_key.strip()
-    if base_url.strip():
+    if base_url and base_url.strip():
         os.environ["ANTHROPIC_BASE_URL"] = base_url.strip()
+    if model and model.strip():
+        os.environ["ANTHROPIC_MODEL"] = model.strip()
+        os.environ["CLAUDE_MODEL"] = model.strip()
 
 
-# ── Tab1: 学习爆款 ────────────────────────────────────────
+def select_ai_provider(provider_id: str):
+    provider = apply_provider(provider_id)
+    return masked_key(provider.api_key), provider.base_url, provider.model, f"✅ 已切换到 {provider.name} · {provider.model}"
+
+
+def refresh_ai_providers():
+    choices = provider_choices()
+    provider = get_provider(os.environ.get("AI_PROVIDER_SELECTED") or os.environ.get("AI_PROVIDER_DEFAULT"))
+    return (
+        gr.update(choices=choices, value=provider.id),
+        masked_key(provider.api_key),
+        provider.base_url,
+        provider.model,
+        f"已发现 {len(choices)} 个 AI Provider。",
+    )
+
+
+def test_ai_provider(provider_id: str):
+    try:
+        provider = apply_provider(provider_id)
+        client = ClaudeClient(provider_id=provider.id)
+        result = client.create_message(
+            model=provider.model,
+            messages=[{"role": "user", "content": "只回复 OK"}],
+            max_tokens=20,
+            temperature=0,
+        )
+        text = result.get("content", [{}])[0].get("text", "").strip()
+        return f"✅ {provider.name} 可用：{text or 'OK'}"
+    except Exception as exc:
+        return f"❌ Provider 测试失败：{exc}"
+
+
+def extract_video_id_from_media(media_path: Path, metadata: dict | None = None) -> str:
+    metadata = metadata or {}
+    for key in ("video_id", "videoId", "aweme_id"):
+        if metadata.get(key):
+            return str(metadata[key])
+
+    import re
+    matches = re.findall(r"(?<!\d)(\d{10,})(?!\d)", media_path.stem)
+    return matches[-1] if matches else media_path.stem
+
+
+def read_media_metadata(media_path: Path) -> dict:
+    metadata_file = media_path.with_suffix(".json")
+    if not metadata_file.exists():
+        return {}
+    try:
+        with open(metadata_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def dataframe_rows(dataframe):
+    """Normalize Gradio Dataframe values across pandas/list return shapes."""
+    if dataframe is None:
+        return []
+    if hasattr(dataframe, "values"):
+        return dataframe.values.tolist()
+    return dataframe
+
+
+def scan_local_videos_with_stats(video_dir: str, status_filter: str = "全部"):
+    """扫描本地视频，并同步返回最新知识库统计，避免顶部计数停留在旧值。"""
+    video_list, status_msg = scan_local_videos(video_dir, status_filter)
+    return video_list, status_msg, kb.get_stats()
+
+
+def ensure_app_dir() -> None:
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def load_json(path: Path, default):
+    if not path.exists():
+        return default
+    try:
+        content = path.read_text(encoding="utf-8").strip()
+        return json.loads(content) if content else default
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def save_json(path: Path, payload) -> None:
+    ensure_app_dir()
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def load_web_projects() -> list[dict]:
+    index = load_json(PROJECTS_INDEX_FILE, {})
+    projects = index.get("projects") if isinstance(index, dict) else None
+    if isinstance(projects, list) and projects:
+        return [item for item in projects if isinstance(item, dict)]
+
+    found = []
+    if PROJECTS_DIR.exists():
+        for project_file in sorted(PROJECTS_DIR.glob("*/project.json")):
+            project = load_json(project_file, {})
+            if isinstance(project, dict) and project.get("id"):
+                found.append(project)
+    return found
+
+
+def project_choices() -> list[tuple[str, str]]:
+    choices = []
+    for project in load_web_projects():
+        label = f"{project.get('name') or project.get('id')} · {project.get('id')}"
+        choices.append((label, str(project.get("id"))))
+    return choices
+
+
+def active_project_id() -> str:
+    config = load_json(UI_CONFIG_FILE, {})
+    active_id = str(config.get("active_project_id") or "").strip() if isinstance(config, dict) else ""
+    project_ids = [str(item.get("id")) for item in load_web_projects()]
+    if active_id in project_ids:
+        return active_id
+    return project_ids[0] if project_ids else ""
+
+
+def project_by_id(project_id: str) -> dict | None:
+    for project in load_web_projects():
+        if str(project.get("id")) == str(project_id):
+            return project
+    return None
+
+
+def project_queue_path(project_id: str) -> Path:
+    project = project_by_id(project_id)
+    if not project:
+        raise ValueError(f"找不到项目：{project_id}")
+    folder = str(project.get("folder") or "")
+    if not folder:
+        raise ValueError(f"项目缺少 folder：{project_id}")
+    return PROJECTS_DIR / folder / "queue.json"
+
+
+def sanitize_project_name(name: str) -> str:
+    value = re.sub(r"[^\w.\-]+", "-", str(name or ""), flags=re.UNICODE).strip("-")
+    return value or "Seedance项目"
+
+
+def default_seedance_project_name(script: str) -> str:
+    text = re.sub(r"\s+", "", str(script or ""))
+    text = re.sub(r"[【】#：:，,。！？!?（）()\"'“”‘’、；;]+", "", text)
+    base = text[:16] or "猫狗动画分镜"
+    return f"{base}-{datetime.now().strftime('%m%d-%H%M')}"
+
+
+def create_web_project(name: str, description: str = "") -> dict:
+    ensure_app_dir()
+    PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+    project_id = f"project-{uuid.uuid4().hex[:10]}"
+    clean_name = str(name or "").strip() or "Seedance动画分镜"
+    folder = f"{sanitize_project_name(clean_name)}-{project_id.split('project-', 1)[1]}"
+    project = {
+        "id": project_id,
+        "name": clean_name,
+        "folder": folder,
+        "description": str(description or ""),
+        "created_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "updated_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    project_dir = PROJECTS_DIR / folder
+    (project_dir / "uploads").mkdir(parents=True, exist_ok=True)
+    save_json(project_dir / "project.json", project)
+    save_json(project_dir / "queue.json", {"version": 1, "segments": []})
+
+    projects = [item for item in load_web_projects() if str(item.get("id")) != project_id]
+    projects.append(project)
+    save_json(PROJECTS_INDEX_FILE, {"version": 1, "projects": projects})
+
+    config = load_json(UI_CONFIG_FILE, {})
+    if not isinstance(config, dict):
+        config = {}
+    config["active_project_id"] = project_id
+    save_json(UI_CONFIG_FILE, config)
+    return project
+
+
+def load_generated_scripts() -> list[dict]:
+    if not GENERATED_SCRIPTS_FILE.exists():
+        return []
+    try:
+        data = json.loads(GENERATED_SCRIPTS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [item for item in data if isinstance(item, dict)]
+
+
+def save_generated_scripts(records: list[dict]) -> None:
+    ensure_app_dir()
+    tmp = GENERATED_SCRIPTS_FILE.with_name(f".{GENERATED_SCRIPTS_FILE.name}.{uuid.uuid4().hex}.tmp")
+    tmp.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(GENERATED_SCRIPTS_FILE)
+
+
+def generated_script_choices() -> list[tuple[str, str]]:
+    choices = []
+    for item in load_generated_scripts():
+        created_at = str(item.get("created_at", ""))[:16].replace("T", " ")
+        topic = str(item.get("topic") or "未命名主题").strip()
+        niche = str(item.get("niche") or "未填赛道").strip()
+        label = f"{created_at} · {topic[:28]} · {niche}"
+        choices.append((label, str(item.get("id"))))
+    return choices
+
+
+def save_generated_script_record(
+    topic: str,
+    niche: str,
+    requirements: str,
+    versions: int,
+    content: str,
+    metadata: dict | None = None,
+) -> dict:
+    record = {
+        "id": uuid.uuid4().hex,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "topic": str(topic or "").strip(),
+        "niche": str(niche or "").strip(),
+        "requirements": str(requirements or "").strip(),
+        "versions": int(versions or 1),
+        "content": str(content or "").strip(),
+        "metadata": metadata or {},
+    }
+    records = [record] + load_generated_scripts()
+    save_generated_scripts(records[:200])
+    return record
+
+
+def refresh_generated_scripts():
+    choices = generated_script_choices()
+    value = choices[0][1] if choices else None
+    status = f"已保存 {len(choices)} 条文案。" if choices else "还没有保存过生成文案。"
+    return gr.update(choices=choices, value=value), status
+
+
+def load_saved_generated_script(script_id: str):
+    for item in load_generated_scripts():
+        if str(item.get("id")) == str(script_id):
+            content = str(item.get("content") or "")
+            display_content = content + format_generation_report(item.get("metadata"))
+            status = f"已载入：{item.get('topic') or '未命名主题'}"
+            return (
+                display_content,
+                content,
+                item.get("topic", ""),
+                item.get("niche", ""),
+                item.get("requirements", ""),
+                int(item.get("versions") or 1),
+                status,
+            )
+    return "", "", gr.update(), gr.update(), gr.update(), gr.update(), "未找到这条保存记录。"
+
+
+def delete_saved_generated_script(script_id: str):
+    records = load_generated_scripts()
+    kept = [item for item in records if str(item.get("id")) != str(script_id)]
+    if len(kept) != len(records):
+        save_generated_scripts(kept)
+    choices = generated_script_choices()
+    value = choices[0][1] if choices else None
+    status = "已删除。" if len(kept) != len(records) else "未找到可删除的记录。"
+    return gr.update(choices=choices, value=value), "", "", status
+
+
+def _first_generated_version(text: str) -> str:
+    body = str(text or "").strip()
+    match = re.search(r"(【版本\s*1[^】]*】.*?)(?=【版本\s*2|\Z)", body, flags=re.S)
+    return match.group(1).strip() if match else body
+
+
+def _split_long_sentence(sentence: str, max_chars: int) -> list[str]:
+    sentence = sentence.strip()
+    if len(sentence) <= max_chars:
+        return [sentence] if sentence else []
+    parts = re.split(r"(?<=[，,；;、])", sentence)
+    chunks: list[str] = []
+    current = ""
+    for part in parts:
+        if not part:
+            continue
+        if current and len(current) + len(part) > max_chars:
+            chunks.append(current.strip())
+            current = part
+        else:
+            current += part
+    if current.strip():
+        chunks.append(current.strip())
+    final: list[str] = []
+    for chunk in chunks:
+        if len(chunk) <= max_chars:
+            final.append(chunk)
+        else:
+            final.extend(chunk[i:i + max_chars] for i in range(0, len(chunk), max_chars))
+    return [item.strip() for item in final if item.strip()]
+
+
+def split_script_into_segments(script: str, max_seconds: int = 15) -> list[dict]:
+    text = _first_generated_version(script)
+    lines = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("参考：") or stripped.startswith("（参考："):
+            continue
+        if re.match(r"^#+\s*", stripped) or re.match(r"^【版本\s*\d+", stripped):
+            continue
+        lines.append(stripped)
+    normalized = re.sub(r"\s+", " ", "".join(lines)).strip()
+    if not normalized:
+        return []
+
+    max_chars = max(35, int(max_seconds) * 4)
+    sentences = re.split(r"(?<=[。！？!?])", normalized)
+    pieces: list[str] = []
+    current = ""
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        for part in _split_long_sentence(sentence, max_chars):
+            if current and len(current) + len(part) > max_chars:
+                pieces.append(current.strip())
+                current = part
+            else:
+                current += part
+    if current.strip():
+        pieces.append(current.strip())
+
+    segments = []
+    for index, narration in enumerate(pieces, 1):
+        seconds = min(int(max_seconds), max(5, round(len(narration) / 4)))
+        segments.append({"index": index, "duration": seconds, "narration": narration})
+    return segments
+
+
+def build_dreamina_prompts(script: str, max_seconds: int, model_version: str):
+    return build_seedance_outputs(script, model_version=model_version or "seedance2.0fast")
+
+
+def refresh_project_choices():
+    choices = project_choices()
+    value = active_project_id() or (choices[0][1] if choices else None)
+    status = f"已发现 {len(choices)} 个项目。" if choices else "未发现 web_app.py 项目。"
+    return gr.update(choices=choices, value=value), status
+
+
+def import_seedance_queue_to_web_queue(queue_json: str, project_id: str):
+    try:
+        payload = json.loads(str(queue_json or "").strip())
+    except json.JSONDecodeError as exc:
+        return f"❌ 队列 JSON 格式错误：{exc}"
+
+    project = project_by_id(project_id or active_project_id())
+    if not project:
+        return "❌ 请先选择要导入的项目。"
+
+    new_segments = payload.get("segments") if isinstance(payload, dict) else payload
+    if not isinstance(new_segments, list) or not new_segments:
+        return "❌ 没有可导入的分镜片段。"
+
+    try:
+        queue_path = project_queue_path(str(project["id"]))
+    except ValueError as exc:
+        return f"❌ {exc}"
+
+    current = load_json(queue_path, {"version": 1, "segments": []})
+    if not isinstance(current, dict):
+        current = {"version": 1, "segments": []}
+    current_segments = current.get("segments")
+    if not isinstance(current_segments, list):
+        current_segments = []
+
+    imported = []
+    for index, segment in enumerate(new_segments, 1):
+        if not isinstance(segment, dict):
+            continue
+        item = dict(segment)
+        item["id"] = f"{item.get('id') or 'seedance'}-{uuid.uuid4().hex[:8]}"
+        item["name"] = str(item.get("name") or f"Seedance动画片段{index:02d}")
+        item["mode"] = str(item.get("mode") or "text2video")
+        item["ratio"] = str(item.get("ratio") or "16:9")
+        item["model_version"] = str(item.get("model_version") or "seedance2.0fast")
+        item.setdefault("images", [])
+        item.setdefault("videos", [])
+        item.setdefault("audios", [])
+        item.setdefault("transition_prompts", [])
+        imported.append(item)
+
+    if not imported:
+        return "❌ 队列里没有有效片段。"
+
+    current["version"] = int(current.get("version") or 1)
+    current["segments"] = current_segments + imported
+    save_json(queue_path, current)
+    project_name = project.get("name") or project.get("id")
+    return f"✅ 已导入 {len(imported)} 个文生视频片段到项目「{project_name}」：{queue_path}"
+
+
+def create_project_and_import_seedance_queue(queue_json: str, project_name: str, script: str):
+    name = str(project_name or "").strip() or default_seedance_project_name(script)
+    project = create_web_project(name, description="Seedance 2.0 猫狗科普动画分镜自动创建")
+    status = import_seedance_queue_to_web_queue(queue_json, str(project["id"]))
+    choices = project_choices()
+    return gr.update(choices=choices, value=project["id"]), f"{status}\n\n已新建独立项目「{project['name']}」。"
+
+
+# ── 知识库导入辅助 ────────────────────────────────────────
 def learn_single(script: str, likes: int, niche: str, api_key: str, base_url: str):
     set_env(api_key, base_url)
     if not script.strip():
@@ -85,7 +546,7 @@ def learn_batch(json_text: str, niche: str, api_key: str, base_url: str):
     yield "\n".join(logs), kb.get_stats()
 
 
-# ── Tab2: 检索知识库 ──────────────────────────────────────
+# ── 检索知识库 ────────────────────────────────────────────
 def search_kb(query: str, niche: str, n: int):
     results = kb.search_scripts(query, n=int(n), niche=niche or None)
     if not results:
@@ -120,17 +581,39 @@ def show_stats(niche: str):
     return out
 
 
-# ── Tab3: 生成文案 ────────────────────────────────────────
-def run_generate(topic: str, niche: str, requirements: str, versions: int, api_key: str, base_url: str):
-    set_env(api_key, base_url)
+# ── 生成文案 ──────────────────────────────────────────────
+def run_generate(
+    topic: str,
+    niche: str,
+    requirements: str,
+    versions: int,
+    api_key: str,
+    base_url: str,
+    model: str,
+    provider_id: str,
+):
+    set_env(api_key, base_url, model, provider_id)
     if not topic.strip():
-        return "❌ 请输入视频主题"
-    yield "⏳ 智能体运行中，正在检索爆款知识库并生成文案..."
-    result = generate(topic=topic, niche=niche, requirements=requirements, versions=int(versions))
-    yield result
+        yield "❌ 请输入视频主题", gr.update(), "未保存：缺少视频主题。", gr.update(), gr.update()
+        return
+    yield "⏳ 智能体运行中，正在检索爆款知识库并生成文案...", gr.update(), "", gr.update(), gr.update()
+    generation = generate_detailed(topic=topic, niche=niche, requirements=requirements, versions=int(versions))
+    result = generation["content"]
+    metadata = generation.get("metadata") or {}
+    report_markdown = generation.get("report_markdown") or format_generation_report(metadata)
+    display_result = result + report_markdown
+    record = save_generated_script_record(topic, niche, requirements, int(versions), result, metadata)
+    status = f"✅ 已自动保存到 {GENERATED_SCRIPTS_FILE} · ID {record['id'][:8]}"
+    yield (
+        display_result,
+        gr.update(choices=generated_script_choices(), value=record["id"]),
+        status,
+        _first_generated_version(result),
+        "已自动载入最新生成文案，可直接拆分即梦提示词。",
+    )
 
 
-# ── Tab4: 抖音采集 ────────────────────────────────────────
+# ── 旧版采集流水线辅助 ────────────────────────────────────
 def run_douyin_pipeline(
     user_urls_text: str,
     max_per_user: int,
@@ -224,156 +707,926 @@ def run_douyin_pipeline(
         loop.close()
 
 
+# ── Tab: 转录本地视频 ──────────────────────────────────────
+def scan_local_videos(video_dir: str, status_filter: str = "全部"):
+    """扫描本地视频目录，返回视频列表和转录状态（递归扫描子目录）"""
+    video_path = Path(video_dir)
+    if not video_path.exists():
+        return [], f"❌ 目录不存在: {video_dir}"
+
+    # 递归扫描所有可转录媒体文件
+    video_files = [
+        path
+        for path in video_path.rglob("*")
+        if path.is_file() and path.suffix.lower() in TRANSCRIBABLE_SUFFIXES
+    ]
+    if not video_files:
+        return [], f"📁 目录中没有找到可转录媒体文件: {video_dir}"
+
+    # 检查每个视频的转录状态
+    video_list = []
+    transcribed_count = 0
+    untranscribed_count = 0
+    imported_count = 0
+    unimported_count = 0
+    imported_video_ids = set()
+
+    for video_file in sorted(video_files):
+        metadata = read_media_metadata(video_file)
+        video_id = extract_video_id_from_media(video_file, metadata)
+        transcript_file = video_file.with_suffix('.transcript.json')
+        is_transcribed = transcript_file.exists()
+        status = "✅ 已转录" if is_transcribed else "⏳ 未转录"
+        is_imported = kb.has_script(video_id) if is_transcribed else False
+        import_status = "✅ 已入库" if is_imported else ("📥 未入库" if is_transcribed else "—")
+
+        # 统计数量
+        if is_transcribed:
+            transcribed_count += 1
+            if is_imported:
+                imported_count += 1
+                imported_video_ids.add(video_id)
+            else:
+                unimported_count += 1
+        else:
+            untranscribed_count += 1
+
+        # 根据筛选条件过滤
+        if status_filter == "已转录" and not is_transcribed:
+            continue
+        elif status_filter == "未转录" and is_transcribed:
+            continue
+        elif status_filter == "未入库" and (not is_transcribed or is_imported):
+            continue
+        elif status_filter == "已入库" and not is_imported:
+            continue
+
+        # 获取文件大小
+        size_mb = video_file.stat().st_size / (1024 * 1024)
+
+        # 显示相对路径（更易读）
+        rel_path = video_file.relative_to(video_path)
+
+        # 返回列表格式，而不是字典
+        video_list.append([
+            False,  # 选择
+            status,  # 状态
+            import_status,  # 入库状态
+            str(rel_path),  # 文件名（相对路径，包含子目录）
+            f"{size_mb:.1f}",  # 大小(MB)
+            video_id,  # 视频 ID
+            str(video_file)  # 完整路径（隐藏列，用于后续处理）
+        ])
+
+    total = len(video_files)
+    shown = len(video_list)
+    status_msg = (
+        f"✅ 共 {total} 个媒体 | 已转录: {transcribed_count} | 未转录: {untranscribed_count} | "
+        f"已入库文件: {imported_count} | 未入库文件: {unimported_count} | "
+        f"知识库唯一视频: {len(imported_video_ids)}"
+    )
+    if status_filter != "全部":
+        status_msg += f" | 当前显示: {shown} 个（{status_filter}）"
+
+    return video_list, status_msg
+
+
+def transcribe_selected_videos(video_dir: str, dataframe, method: str, api_key: str):
+    """转录选中的视频"""
+    if dataframe is None or len(dataframe) == 0:
+        yield "❌ 没有视频可转录", None
+        return
+
+    # 设置 API key
+    if method == "yunwu" and api_key:
+        os.environ["YUNWU_API_KEY"] = api_key
+    elif method == "groq" and api_key:
+        os.environ["GROQ_API_KEY"] = api_key
+
+    # 获取选中的视频
+    selected = [row for row in dataframe_rows(dataframe) if row and row[0]]  # row[0] 是"选择"列
+
+    if not selected:
+        yield "❌ 请至少选择一个视频", None
+        return
+
+    total = len(selected)
+    logs = [f"🚀 开始转录 {total} 个视频（方式: {method}）\n"]
+    yield "\n".join(logs), None
+
+    success_count = 0
+    skip_count = 0
+    error_count = 0
+
+    for i, row in enumerate(selected, 1):
+        status = row[1]    # row[1] 是"状态"列
+        filename = row[3]  # row[3] 是"文件名"列
+
+        video_path = Path(video_dir) / filename
+
+        # 检查文件是否存在和完整性
+        if not video_path.exists():
+            logs.append(f"[{i}/{total}] ❌ {filename} - 文件不存在")
+            error_count += 1
+            yield "\n".join(logs), None
+            continue
+
+        # 检查文件大小（小于 1KB 可能是损坏文件）
+        file_size = video_path.stat().st_size
+        if file_size < 1024:
+            logs.append(f"[{i}/{total}] ⚠️  {filename} - 文件损坏（仅 {file_size} 字节），跳过")
+            skip_count += 1
+            yield "\n".join(logs), None
+            continue
+
+        # 跳过已转录的视频
+        if "已转录" in status:
+            logs.append(f"[{i}/{total}] ⏭️  {filename} - 已转录，跳过")
+            skip_count += 1
+            yield "\n".join(logs), None
+            continue
+
+        logs.append(f"[{i}/{total}] 🎬 {filename} - 转录中...")
+        yield "\n".join(logs), None
+
+        try:
+            # 执行转录
+            result = extract_transcript(
+                video_path=video_path,
+                method=method,
+                save_json=True,
+                api_key=api_key if api_key else None
+            )
+
+            text_preview = result["text"][:100] + "..." if len(result["text"]) > 100 else result["text"]
+            logs[-1] = f"[{i}/{total}] ✅ {filename} - 转录完成"
+            logs.append(f"    预览: {text_preview}")
+            success_count += 1
+
+            # 更新视频 JSON 文件，添加转录标识
+            video_json_path = video_path.with_suffix('.json')
+            if video_json_path.exists():
+                try:
+                    with open(video_json_path, 'r', encoding='utf-8') as f:
+                        video_info = json.load(f)
+
+                    video_info['transcribed'] = True
+                    video_info['transcribed_time'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    video_info['transcription_method'] = method
+
+                    with open(video_json_path, 'w', encoding='utf-8') as f:
+                        json.dump(video_info, f, ensure_ascii=False, indent=2)
+                except Exception as json_err:
+                    logs.append(f"    ⚠️  更新 JSON 文件失败: {str(json_err)}")
+
+        except Exception as e:
+            logs[-1] = f"[{i}/{total}] ❌ {filename} - 失败: {str(e)}"
+            error_count += 1
+
+        yield "\n".join(logs), None
+
+    # 最终统计
+    logs.append(f"\n{'='*60}")
+    logs.append(f"🎉 转录完成！")
+    logs.append(f"   ✅ 成功: {success_count} 个")
+    logs.append(f"   ⏭️  跳过: {skip_count} 个")
+    logs.append(f"   ❌ 失败: {error_count} 个")
+    logs.append(f"{'='*60}")
+
+    # 刷新视频列表
+    updated_list, _ = scan_local_videos(video_dir)
+
+    yield "\n".join(logs), updated_list
+
+
+def import_selected_transcripts(
+    video_dir: str,
+    dataframe,
+    default_niche: str,
+    api_key: str,
+    base_url: str,
+    model: str = "",
+    provider_id: str = "",
+):
+    """把勾选的已转录/未入库文案分析后导入知识库。"""
+    set_env(api_key, base_url, model, provider_id)
+
+    if dataframe is None or len(dataframe) == 0:
+        yield "❌ 没有媒体可导入", None, kb.get_stats()
+        return
+
+    selected = [row for row in dataframe_rows(dataframe) if row and row[0]]
+    if not selected:
+        yield "❌ 请至少选择一个已转录且未入库的媒体", None, kb.get_stats()
+        return
+
+    total = len(selected)
+    logs = [f"🚀 开始导入 {total} 条转录文案到知识库\n"]
+    yield "\n".join(logs), None, kb.get_stats()
+
+    success_count = 0
+    skip_count = 0
+    error_count = 0
+
+    for i, row in enumerate(selected, 1):
+        transcribe_status = str(row[1])
+        import_status = str(row[2])
+        filename = str(row[3])
+        video_id = str(row[5] or "")
+        media_path = Path(video_dir) / filename
+
+        if "已转录" not in transcribe_status:
+            logs.append(f"[{i}/{total}] ⏭️ {filename} - 未转录，跳过")
+            skip_count += 1
+            yield "\n".join(logs), None, kb.get_stats()
+            continue
+
+        if "已入库" in import_status or kb.has_script(video_id):
+            logs.append(f"[{i}/{total}] ⏭️ {filename} - 已入库，跳过")
+            skip_count += 1
+            yield "\n".join(logs), None, kb.get_stats()
+            continue
+
+        transcript_file = media_path.with_suffix(".transcript.json")
+        if not transcript_file.exists():
+            logs.append(f"[{i}/{total}] ❌ {filename} - 找不到转录文件")
+            error_count += 1
+            yield "\n".join(logs), None, kb.get_stats()
+            continue
+
+        try:
+            with open(transcript_file, "r", encoding="utf-8") as f:
+                transcript = json.load(f)
+            script = str(transcript.get("text", "")).strip()
+
+            if len(script) < 30:
+                logs.append(f"[{i}/{total}] ⏭️ {filename} - 文案过短，跳过")
+                skip_count += 1
+                yield "\n".join(logs), None, kb.get_stats()
+                continue
+
+            metadata = read_media_metadata(media_path)
+            video_id = video_id or extract_video_id_from_media(media_path, metadata)
+            tags = metadata.get("tags", [])
+            auto_niche = tags[0] if isinstance(tags, list) and tags else ""
+            niche = default_niche.strip() or auto_niche
+            likes = int(metadata.get("likes", 0) or 0)
+
+            logs.append(f"[{i}/{total}] 🧠 {filename} - 分析并入库中...")
+            yield "\n".join(logs), None, kb.get_stats()
+
+            analysis = analyze_script(script, likes=likes, niche=niche)
+            kb.add_script(
+                video_id=video_id,
+                script=script,
+                analysis=analysis,
+                metadata={
+                    "likes": likes,
+                    "niche": niche,
+                    "platform": "douyin",
+                    "media_path": str(media_path),
+                    "transcript_path": str(transcript_file),
+                    "title": metadata.get("title", ""),
+                    "description": metadata.get("description", "") or metadata.get("desc", ""),
+                    "video_url": metadata.get("video_url", ""),
+                    "author": metadata.get("author", ""),
+                    "media_type": metadata.get("media_type", ""),
+                    "tags": ",".join(tags) if isinstance(tags, list) else str(tags or ""),
+                },
+            )
+
+            metadata["imported_to_kb"] = True
+            metadata["imported_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            metadata["kb_video_id"] = video_id
+            with open(media_path.with_suffix(".json"), "w", encoding="utf-8") as f:
+                json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+            logs[-1] = f"[{i}/{total}] ✅ {filename} - 已导入知识库"
+            success_count += 1
+
+        except Exception as e:
+            logs.append(f"[{i}/{total}] ❌ {filename} - 导入失败: {e}")
+            error_count += 1
+
+        yield "\n".join(logs), None, kb.get_stats()
+
+    logs.append(f"\n{'='*60}")
+    logs.append("🎉 导入完成！")
+    logs.append(f"   ✅ 成功: {success_count} 条")
+    logs.append(f"   ⏭️  跳过: {skip_count} 条")
+    logs.append(f"   ❌ 失败: {error_count} 条")
+    logs.append(f"{'='*60}")
+
+    updated_list, _ = scan_local_videos(video_dir)
+    yield "\n".join(logs), updated_list, kb.get_stats()
+
+
+# ── Tab: Selenium 抖音采集 ──────────────────────────────────
+def load_selenium_accounts():
+    """加载 web_app.py 同款抖音账号列表。"""
+    if not DOUYIN_ACCOUNTS_FILE.exists():
+        return []
+    try:
+        with open(DOUYIN_ACCOUNTS_FILE, "r", encoding="utf-8") as f:
+            accounts = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(accounts, list):
+        return []
+    return [acc for acc in accounts if isinstance(acc, dict) and acc.get("url")]
+
+
+def save_selenium_accounts(accounts):
+    """保存 web_app.py 同款抖音账号列表。"""
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    with open(DOUYIN_ACCOUNTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(accounts, f, ensure_ascii=False, indent=2)
+
+
+def selenium_accounts_to_rows(accounts=None):
+    accounts = accounts if accounts is not None else load_selenium_accounts()
+    return [
+        [
+            bool(acc.get("enabled", True)),
+            acc.get("url", ""),
+            acc.get("status", "pending") or "pending",
+            int(acc.get("progress", 0) or 0),
+        ]
+        for acc in accounts
+    ]
+
+
+def selenium_rows_to_accounts(rows):
+    if rows is None:
+        return []
+
+    values = rows.values.tolist() if hasattr(rows, "values") else rows
+    accounts = []
+    for row in values:
+        if not row or len(row) < 2:
+            continue
+        url = str(row[1] or "").strip()
+        if not url:
+            continue
+        enabled_value = row[0]
+        enabled = enabled_value
+        if isinstance(enabled_value, str):
+            enabled = enabled_value.strip().lower() not in {"false", "0", "否", "no", ""}
+        accounts.append({
+            "enabled": bool(enabled),
+            "url": url,
+            "status": str(row[2] or "pending") if len(row) > 2 else "pending",
+            "progress": int(float(row[3] or 0)) if len(row) > 3 else 0,
+        })
+    return accounts
+
+
+def selenium_account_stats(rows=None):
+    if rows is None:
+        accounts = load_selenium_accounts()
+    elif isinstance(rows, list) and (not rows or isinstance(rows[0], dict)):
+        accounts = rows
+    else:
+        accounts = selenium_rows_to_accounts(rows)
+    total = len(accounts)
+    completed = sum(1 for acc in accounts if acc.get("status") == "completed")
+    pending = sum(1 for acc in accounts if not acc.get("status") or acc.get("status") == "pending")
+    enabled = sum(1 for acc in accounts if acc.get("enabled", True))
+    return f"**总账号数:** {total}　**启用:** {enabled}　**已完成:** {completed}　**待下载:** {pending}"
+
+
+def load_selenium_accounts_ui():
+    rows = selenium_accounts_to_rows()
+    return rows, selenium_account_stats(rows)
+
+
+def add_selenium_account(account_url: str, rows):
+    url = (account_url or "").strip()
+    accounts = selenium_rows_to_accounts(rows)
+
+    if not url:
+        return selenium_accounts_to_rows(accounts), "", selenium_account_stats(accounts), "❌ 请输入抖音账号链接"
+    if "douyin.com" not in url:
+        return selenium_accounts_to_rows(accounts), account_url, selenium_account_stats(accounts), "❌ 请输入有效的抖音链接"
+    if any(acc.get("url") == url for acc in accounts):
+        return selenium_accounts_to_rows(accounts), "", selenium_account_stats(accounts), "ℹ️ 账号已存在"
+
+    accounts.append({"url": url, "status": "pending", "enabled": True, "progress": 0})
+    save_selenium_accounts(accounts)
+    add_selenium_log("info", f"已添加账号: {url}")
+    rows = selenium_accounts_to_rows(accounts)
+    return rows, "", selenium_account_stats(rows), format_selenium_logs()
+
+
+def save_selenium_accounts_ui(rows):
+    accounts = selenium_rows_to_accounts(rows)
+    save_selenium_accounts(accounts)
+    add_selenium_log("info", "账号列表已保存")
+    rows = selenium_accounts_to_rows(accounts)
+    return rows, selenium_account_stats(rows), format_selenium_logs()
+
+
+def clear_completed_selenium_accounts(rows):
+    accounts = [acc for acc in selenium_rows_to_accounts(rows) if acc.get("status") != "completed"]
+    save_selenium_accounts(accounts)
+    add_selenium_log("info", "已清除所有已完成的账号")
+    rows = selenium_accounts_to_rows(accounts)
+    return rows, selenium_account_stats(rows), format_selenium_logs()
+
+
+def clear_all_selenium_accounts():
+    save_selenium_accounts([])
+    add_selenium_log("info", "已清空账号列表")
+    return [], selenium_account_stats([]), format_selenium_logs()
+
+
+def add_selenium_log(level: str, message: str):
+    """添加日志"""
+    global selenium_task
+    log_entry = {
+        "level": level,
+        "message": message,
+        "time": time.strftime("%H:%M:%S")
+    }
+    selenium_task["logs"].append(log_entry)
+    # 只保留最近50条
+    if len(selenium_task["logs"]) > 50:
+        selenium_task["logs"] = selenium_task["logs"][-50:]
+
+
+def format_selenium_logs():
+    if not selenium_task["logs"]:
+        return "[等待开始] 准备就绪，等待启动下载任务..."
+    return "\n".join([
+        f"[{log['time']}] {log['message']}"
+        for log in selenium_task["logs"][-20:]
+    ])
+
+
+def start_selenium_download(rows, save_path: str, min_likes: int,
+                           organize_by_tag: bool, save_metadata: bool, auto_next: bool):
+    """启动 Selenium 下载任务"""
+    global selenium_task
+
+    if selenium_task["is_running"]:
+        return "❌ 下载任务已在运行中，请先停止当前任务", rows, selenium_account_stats(rows)
+
+    accounts = selenium_rows_to_accounts(rows)
+    save_selenium_accounts(accounts)
+    active_accounts = [
+        (idx, acc)
+        for idx, acc in enumerate(accounts)
+        if acc.get("enabled", True)
+    ]
+    user_urls = [acc["url"] for _, acc in active_accounts]
+    if not user_urls:
+        return "❌ 请至少添加并启用一个账号", selenium_accounts_to_rows(accounts), selenium_account_stats(accounts)
+
+    # 初始化任务状态
+    selenium_task["is_running"] = True
+    selenium_task["accounts_status"] = []
+    selenium_task["logs"] = []
+    selenium_task["current_account"] = 0
+    selenium_task["total_accounts"] = len(user_urls)
+    selenium_task["active_account_indices"] = [idx for idx, _ in active_accounts]
+
+    add_selenium_log("info", f"启动下载任务，共 {len(user_urls)} 个账号")
+    if save_metadata:
+        add_selenium_log("info", "视频元数据将随视频保存")
+
+    # 后台线程运行下载
+    def run_download():
+        try:
+            from douyin_selenium import DouyinSeleniumDownloader
+
+            def progress_callback(account_index, status, progress, **kwargs):
+                """进度回调"""
+                selenium_task["current_account"] = account_index + 1
+                if account_index < len(selenium_task["accounts_status"]):
+                    selenium_task["accounts_status"][account_index] = {
+                        "url": user_urls[account_index],
+                        "status": status,
+                        "progress": progress,
+                        **kwargs
+                    }
+
+            def log_callback(level, message):
+                """日志回调"""
+                add_selenium_log(level, message)
+
+            downloader = DouyinSeleniumDownloader(
+                output_dir=save_path,
+                organize_by_tag=organize_by_tag,
+                progress_callback=progress_callback,
+                log_callback=log_callback
+            )
+
+            selenium_task["downloader"] = downloader
+
+            # 初始化账号状态
+            for url in user_urls:
+                selenium_task["accounts_status"].append({
+                    "url": url,
+                    "status": "pending",
+                    "progress": 0
+                })
+
+            # 运行批量下载
+            downloader.run_batch(
+                user_urls=user_urls,
+                scroll_times=10,
+                min_likes=min_likes,
+                auto_mode=auto_next
+            )
+
+            add_selenium_log("success", "所有下载任务已完成")
+
+        except Exception as e:
+            add_selenium_log("error", f"下载任务异常: {str(e)}")
+            import traceback
+            add_selenium_log("error", traceback.format_exc())
+        finally:
+            selenium_task["is_running"] = False
+            selenium_task["downloader"] = None
+
+    thread = threading.Thread(target=run_download, daemon=True)
+    thread.start()
+    selenium_task["thread"] = thread
+
+    return format_selenium_logs(), selenium_accounts_to_rows(accounts), selenium_account_stats(accounts)
+
+
+def stop_selenium_download():
+    """停止 Selenium 下载任务"""
+    global selenium_task
+
+    if not selenium_task["is_running"]:
+        return "ℹ️ 没有运行中的任务"
+
+    try:
+        downloader = selenium_task.get("downloader")
+        if downloader:
+            downloader.stop()
+
+        add_selenium_log("info", "下载任务已停止")
+        return format_selenium_logs()
+    except Exception as e:
+        return f"❌ 停止失败: {str(e)}"
+
+
+def get_selenium_status(rows):
+    """获取 Selenium 下载状态"""
+    global selenium_task
+
+    # 检查线程是否还在运行
+    if selenium_task["is_running"]:
+        thread = selenium_task.get("thread")
+        if thread and not thread.is_alive():
+            selenium_task["is_running"] = False
+            selenium_task["thread"] = None
+            add_selenium_log("success", "所有下载任务已完成")
+
+    accounts = selenium_rows_to_accounts(rows)
+    active_indices = selenium_task.get("active_account_indices", [])
+    for idx, status in enumerate(selenium_task["accounts_status"]):
+        account_index = active_indices[idx] if idx < len(active_indices) else idx
+        if account_index < len(accounts):
+            accounts[account_index]["status"] = status.get("status", accounts[account_index].get("status", "pending"))
+            accounts[account_index]["progress"] = status.get("progress", accounts[account_index].get("progress", 0))
+    current_rows = selenium_accounts_to_rows(accounts)
+
+    # 格式化状态信息
+    status_text = f"**运行状态:** {'🟢 运行中' if selenium_task['is_running'] else '⚪ 空闲'}\n\n"
+
+    if selenium_task["total_accounts"] > 0:
+        status_text += f"**进度:** {selenium_task['current_account']}/{selenium_task['total_accounts']} 个账号\n\n"
+
+    # 账号状态
+    if selenium_task["accounts_status"]:
+        status_text += "**账号状态:**\n\n"
+        for i, acc in enumerate(selenium_task["accounts_status"], 1):
+            status_icon = {
+                "pending": "⏳",
+                "downloading": "📥",
+                "completed": "✅",
+                "error": "❌"
+            }.get(acc.get("status", "pending"), "⏳")
+
+            status_text += f"{i}. {status_icon} {acc.get('url', 'Unknown')[:50]}... - {acc.get('status', 'pending')}\n"
+
+    return status_text, format_selenium_logs(), current_rows, selenium_account_stats(current_rows)
+
+
 # ── 界面布局 ──────────────────────────────────────────────
-with gr.Blocks(title="爆款文案智能体", theme=gr.themes.Soft()) as demo:
+with gr.Blocks(title="爆款文案智能体") as demo:
     gr.Markdown("# 🔥 爆款文案智能体\n基于爆款视频知识库，自动生成高质量短视频文案")
 
     # 全局配置
     with gr.Accordion("⚙️ API 配置", open=False):
         with gr.Row():
+            provider_input = gr.Dropdown(
+                label="AI Provider",
+                choices=provider_choices(),
+                value=(DEFAULT_PROVIDER.id if DEFAULT_PROVIDER else None),
+                interactive=True,
+                scale=2,
+            )
+            refresh_provider_btn = gr.Button("刷新 Provider", scale=1)
+            test_provider_btn = gr.Button("测试当前 Provider", scale=1)
+        with gr.Row():
             api_key_input = gr.Textbox(
-                value=DEFAULT_API_KEY, label="API Key",
+                value=masked_key(DEFAULT_API_KEY), label="API Key（来自 .env，默认隐藏）",
                 placeholder="sk-...", type="password", scale=3,
             )
             base_url_input = gr.Textbox(
                 value=DEFAULT_BASE_URL, label="Base URL",
                 placeholder="https://api.anthropic.com", scale=2,
             )
+            model_input = gr.Textbox(
+                value=DEFAULT_MODEL, label="模型",
+                placeholder="claude-sonnet-4-6", scale=2,
+            )
+        provider_status = gr.Markdown()
+
+        provider_input.change(
+            select_ai_provider,
+            inputs=[provider_input],
+            outputs=[api_key_input, base_url_input, model_input, provider_status],
+        )
+        refresh_provider_btn.click(
+            refresh_ai_providers,
+            outputs=[provider_input, api_key_input, base_url_input, model_input, provider_status],
+        )
+        test_provider_btn.click(
+            test_ai_provider,
+            inputs=[provider_input],
+            outputs=[provider_status],
+        )
 
     kb_stats = gr.Markdown(value=kb.get_stats(), label="知识库状态")
 
     with gr.Tabs():
-        # ── Tab 0: 抖音采集 ──
-        with gr.Tab("📥 抖音采集"):
+        # ── Tab 0: 转录本地视频 ──
+        with gr.Tab("🎬 转录本地视频"):
             gr.Markdown("""
-### 🎯 从抖音爆款账号批量采集视频文案
+### 📹 转录本地视频文件
 
 **使用步骤：**
-1. 输入抖音用户主页链接（每行一个）
-2. 设置筛选条件（点赞数阈值、下载数量）
-3. 选择转录方式（Whisper 本地 或 Groq API）
-4. 点击开始采集，等待完成
-5. 可选：自动导入到知识库
+1. 输入视频目录路径（默认 `./douyin_videos`）
+2. 点击"扫描视频"查看视频列表
+3. 勾选需要转录的视频（已转录的会显示 ✅）
+4. 选择转录方式（推荐使用云雾 API）
+5. 点击"开始转录"，逐字稿会保存到视频同目录下
+6. 在列表里看到"已转录 / 未入库"后，勾选并点击"导入知识库"
             """)
 
             with gr.Row():
                 with gr.Column(scale=1):
-                    user_urls_input = gr.Textbox(
-                        label="抖音用户主页链接（每行一个）",
-                        placeholder="https://www.douyin.com/user/MS4wLjABAAAA...\nhttps://www.douyin.com/user/MS4wLjABAAAA...",
-                        lines=5
+                    video_dir_input = gr.Textbox(
+                        label="视频目录路径",
+                        value="./douyin_videos",
+                        placeholder="./douyin_videos"
                     )
-                    with gr.Row():
-                        min_likes_input = gr.Number(
-                            label="最低点赞数",
-                            value=100000,
-                            minimum=0,
-                            info="只下载点赞数超过此值的视频"
-                        )
-                        max_per_user_input = gr.Number(
-                            label="每账号最多下载",
-                            value=20,
-                            minimum=1,
-                            maximum=100,
-                            info="每个账号最多下载多少个视频"
-                        )
 
-                    transcribe_method_input = gr.Radio(
+                    status_filter = gr.Radio(
+                        label="状态筛选",
+                        choices=["全部", "已转录", "未转录", "未入库", "已入库"],
+                        value="全部",
+                        info="筛选要显示的视频"
+                    )
+
+                    scan_btn = gr.Button("🔍 扫描视频", variant="secondary")
+
+                    transcribe_method_local = gr.Radio(
                         label="转录方式",
-                        choices=["whisper", "groq"],
-                        value="whisper",
-                        info="whisper=本地（慢但免费），groq=云端（快但需API key）"
-                    )
-                    whisper_model_input = gr.Dropdown(
-                        label="Whisper 模型（仅本地模式）",
-                        choices=["tiny", "base", "small", "medium", "large-v3"],
-                        value="base",
-                        info="模型越大越准确但越慢"
+                        choices=["yunwu", "groq", "whisper"],
+                        value="yunwu",
+                        info="⚠️ whisper需下载2.88GB模型！推荐使用yunwu（云端，无需下载）"
                     )
 
-                    with gr.Row():
-                        auto_import_input = gr.Checkbox(
-                            label="自动导入到知识库",
-                            value=True,
-                            info="采集完成后自动分析并导入"
-                        )
-                        douyin_niche_input = gr.Textbox(
-                            label="赛道标签",
-                            placeholder="情感、干货、美食...",
-                            value="",
-                            scale=2
-                        )
+                    transcribe_api_key = gr.Textbox(
+                        label="API Key（yunwu/groq 需要）",
+                        value=DEFAULT_TRANSCRIBE_API_KEY,
+                        type="password",
+                        placeholder="sk-..."
+                    )
 
-                    douyin_btn = gr.Button("🚀 开始采集", variant="primary", size="lg")
+                    transcribe_btn = gr.Button("🚀 开始转录选中视频", variant="primary", size="lg")
+
+                    import_niche_input = gr.Dropdown(
+                        label="默认赛道",
+                        choices=["猫狗科普", "宠物健康", "宠物救助", "动物行为学", "动物解说", "动物科普"],
+                        value="猫狗科普",
+                        allow_custom_value=True,
+                        info="导入知识库时使用的赛道标签，可手动输入自定义赛道"
+                    )
+                    import_kb_btn = gr.Button("📥 导入知识库", variant="secondary", size="lg")
 
                 with gr.Column(scale=2):
-                    douyin_output = gr.Textbox(
-                        label="采集日志",
-                        lines=20,
-                        max_lines=30,
+                    scan_status = gr.Textbox(label="扫描状态", lines=1, interactive=False)
+                    video_list_df = gr.Dataframe(
+                        headers=["选择", "转录状态", "入库状态", "文件名", "大小(MB)", "视频ID", "路径"],
+                        datatype=["bool", "str", "str", "str", "str", "str", "str"],
+                        column_count=(7, "fixed"),
+                        label="视频列表",
+                        interactive=True,
+                        wrap=True
+                    )
+
+            transcribe_log = gr.Textbox(
+                label="转录日志",
+                lines=15,
+                max_lines=25,
+                interactive=False
+            )
+
+            import_log = gr.Textbox(
+                label="入库日志",
+                lines=12,
+                max_lines=25,
+                interactive=False
+            )
+
+            # 扫描视频
+            scan_btn.click(
+                scan_local_videos_with_stats,
+                inputs=[video_dir_input, status_filter],
+                outputs=[video_list_df, scan_status, kb_stats]
+            )
+
+            # 状态筛选变化时重新扫描
+            status_filter.change(
+                scan_local_videos_with_stats,
+                inputs=[video_dir_input, status_filter],
+                outputs=[video_list_df, scan_status, kb_stats]
+            )
+
+            # 转录视频
+            transcribe_btn.click(
+                transcribe_selected_videos,
+                inputs=[video_dir_input, video_list_df, transcribe_method_local, transcribe_api_key],
+                outputs=[transcribe_log, video_list_df]
+            )
+
+            import_kb_btn.click(
+                import_selected_transcripts,
+                inputs=[video_dir_input, video_list_df, import_niche_input, api_key_input, base_url_input, model_input, provider_input],
+                outputs=[import_log, video_list_df, kb_stats]
+            )
+
+        # ── Tab: Selenium 抖音采集 ──
+        with gr.Tab("🤖 Selenium 采集"):
+            gr.Markdown("""
+### 抖音视频采集器
+批量采集抖音账号的爆款视频，支持元数据提取和智能分类
+            """)
+
+            with gr.Row():
+                with gr.Column(scale=2):
+                    gr.Markdown("### 账号列表")
+                    selenium_account_stats_display = gr.Markdown(value=selenium_account_stats())
+
+                    selenium_account_input = gr.Textbox(
+                        label="添加抖音账号链接",
+                        placeholder="粘贴抖音账号主页链接，例如：https://www.douyin.com/user/..."
+                    )
+
+                    with gr.Row():
+                        selenium_add_account_btn = gr.Button("添加账号", variant="primary")
+                        selenium_save_accounts_btn = gr.Button("保存列表", variant="secondary")
+                        selenium_clear_completed_btn = gr.Button("清除已完成", variant="secondary")
+                        selenium_clear_all_btn = gr.Button("清空列表", variant="secondary")
+
+                    selenium_accounts_df = gr.Dataframe(
+                        headers=["启用", "账号链接", "状态", "进度"],
+                        datatype=["bool", "str", "str", "number"],
+                        value=selenium_accounts_to_rows(),
+                        column_count=(4, "fixed"),
+                        label="账号列表",
+                        interactive=True,
+                        wrap=True
+                    )
+
+                    gr.Markdown("### 下载日志")
+                    selenium_log_display = gr.Textbox(
+                        label="实时日志",
+                        value=format_selenium_logs(),
+                        lines=15,
+                        max_lines=20,
                         interactive=False
                     )
 
-            douyin_btn.click(
-                run_douyin_pipeline,
-                inputs=[
-                    user_urls_input,
-                    max_per_user_input,
-                    min_likes_input,
-                    transcribe_method_input,
-                    whisper_model_input,
-                    auto_import_input,
-                    douyin_niche_input,
-                    api_key_input,
-                    base_url_input
-                ],
-                outputs=[douyin_output, kb_stats]
+                with gr.Column(scale=1):
+                    gr.Markdown("### 下载设置")
+
+                    selenium_save_path = gr.Textbox(
+                        label="保存路径",
+                        value="./douyin_videos",
+                        info="视频保存的目录"
+                    )
+
+                    selenium_min_likes = gr.Number(
+                        label="最低点赞数",
+                        value=1000,
+                        minimum=0,
+                        info="只下载点赞数超过此值的视频"
+                    )
+
+                    selenium_organize_by_tag = gr.Checkbox(
+                        label="按标签分类保存",
+                        value=True,
+                        info="自动按视频标签创建子目录"
+                    )
+
+                    selenium_save_metadata = gr.Checkbox(
+                        label="保存视频元数据",
+                        value=True
+                    )
+
+                    selenium_auto_next = gr.Checkbox(
+                        label="自动切换下一个账号",
+                        value=True
+                    )
+
+                    with gr.Row():
+                        selenium_start_btn = gr.Button("开始下载", variant="primary", size="lg")
+                        selenium_stop_btn = gr.Button("停止下载", variant="stop", size="lg")
+
+                    selenium_status_display = gr.Markdown(
+                        value="**运行状态:** ⚪ 空闲",
+                        label="任务状态"
+                    )
+
+                    gr.Markdown("""
+### 使用说明
+1. 安装 Tampermonkey 浏览器扩展
+2. 导入 `douyin/douyin_downloader/tampermonkey_script.js`
+3. 添加要采集的抖音账号链接
+4. 配置下载参数
+5. 点击开始下载启动浏览器
+6. 等待自动扫描和下载完成
+                    """)
+
+            selenium_add_account_btn.click(
+                add_selenium_account,
+                inputs=[selenium_account_input, selenium_accounts_df],
+                outputs=[
+                    selenium_accounts_df,
+                    selenium_account_input,
+                    selenium_account_stats_display,
+                    selenium_log_display
+                ]
             )
 
-        # ── Tab 1: 学习 ──
-        with gr.Tab("📥 学习爆款"):
-            with gr.Tabs():
-                with gr.Tab("单条录入"):
-                    with gr.Row():
-                        with gr.Column(scale=2):
-                            script_input = gr.Textbox(
-                                label="爆款文案内容",
-                                placeholder="粘贴爆款视频的文案...",
-                                lines=8,
-                            )
-                            with gr.Row():
-                                likes_input = gr.Number(label="点赞数", value=100000, minimum=0)
-                                niche_input1 = gr.Textbox(label="赛道", placeholder="情感、干货、美食...")
-                            learn_btn = gr.Button("🚀 分析并存入知识库", variant="primary")
-                        with gr.Column(scale=2):
-                            learn_output = gr.Markdown(label="分析结果")
+            selenium_save_accounts_btn.click(
+                save_selenium_accounts_ui,
+                inputs=[selenium_accounts_df],
+                outputs=[selenium_accounts_df, selenium_account_stats_display, selenium_log_display]
+            )
 
-                    learn_btn.click(
-                        learn_single,
-                        inputs=[script_input, likes_input, niche_input1, api_key_input, base_url_input],
-                        outputs=[learn_output, kb_stats],
-                    )
+            selenium_clear_completed_btn.click(
+                clear_completed_selenium_accounts,
+                inputs=[selenium_accounts_df],
+                outputs=[selenium_accounts_df, selenium_account_stats_display, selenium_log_display]
+            )
 
-                with gr.Tab("批量导入 JSON"):
-                    json_input = gr.Textbox(
-                        label="JSON 格式文案列表",
-                        placeholder='''[
-  {"video_id": "v001", "script": "文案内容...", "likes": 100000, "niche": "情感"},
-  {"video_id": "v002", "script": "文案内容...", "likes": 200000, "niche": "干货"}
-]''',
-                        lines=12,
-                    )
-                    niche_input2 = gr.Textbox(label="默认赛道（JSON中无niche时使用）", placeholder="情感")
-                    batch_btn = gr.Button("🚀 批量分析导入", variant="primary")
-                    batch_output = gr.Textbox(label="处理日志", lines=10)
+            selenium_clear_all_btn.click(
+                clear_all_selenium_accounts,
+                outputs=[selenium_accounts_df, selenium_account_stats_display, selenium_log_display]
+            )
 
-                    batch_btn.click(
-                        learn_batch,
-                        inputs=[json_input, niche_input2, api_key_input, base_url_input],
-                        outputs=[batch_output, kb_stats],
-                    )
+            # 定时刷新状态
+            selenium_refresh_timer = gr.Timer(value=2.0, active=True)
+            selenium_refresh_timer.tick(
+                get_selenium_status,
+                inputs=[selenium_accounts_df],
+                outputs=[
+                    selenium_status_display,
+                    selenium_log_display,
+                    selenium_accounts_df,
+                    selenium_account_stats_display
+                ]
+            )
 
-        # ── Tab 2: 知识库 ──
+            selenium_start_btn.click(
+                start_selenium_download,
+                inputs=[
+                    selenium_accounts_df,
+                    selenium_save_path,
+                    selenium_min_likes,
+                    selenium_organize_by_tag,
+                    selenium_save_metadata,
+                    selenium_auto_next
+                ],
+                outputs=[selenium_log_display, selenium_accounts_df, selenium_account_stats_display]
+            )
+
+            selenium_stop_btn.click(
+                stop_selenium_download,
+                outputs=[selenium_log_display]
+            )
+
+        # ── Tab 1: 知识库 ──
         with gr.Tab("🗂️ 知识库"):
             with gr.Tabs():
                 with gr.Tab("语义检索"):
@@ -391,11 +1644,15 @@ with gr.Blocks(title="爆款文案智能体", theme=gr.themes.Soft()) as demo:
                     stats_output = gr.Markdown()
                     stats_btn.click(show_stats, inputs=[stats_niche], outputs=stats_output)
 
-        # ── Tab 3: 生成 ──
+        # ── Tab 2: 生成 ──
         with gr.Tab("✍️ 生成文案"):
             with gr.Row():
                 with gr.Column(scale=1):
-                    topic_input = gr.Textbox(label="视频主题 *", placeholder="普通人如何月入过万", lines=2)
+                    topic_input = gr.Textbox(
+                        label="视频主题 / 参考原文 *",
+                        placeholder="短主题：普通人如何月入过万\n或粘贴一段参考原文，系统会提炼选题后重新创作，避免照抄。",
+                        lines=8,
+                    )
                     niche_input3 = gr.Textbox(label="赛道", placeholder="干货、情感、美食...")
                     req_input = gr.Textbox(
                         label="额外要求（可选）",
@@ -406,25 +1663,155 @@ with gr.Blocks(title="爆款文案智能体", theme=gr.themes.Soft()) as demo:
                     gen_btn = gr.Button("🔥 生成爆款文案", variant="primary", size="lg")
                 with gr.Column(scale=2):
                     gen_output = gr.Markdown(label="生成结果")
+                    gen_save_status = gr.Markdown()
+
+            with gr.Accordion("💾 已保存文案 / Seedance 2.0 动画提示词拆分", open=True):
+                with gr.Row():
+                    gen_saved_dropdown = gr.Dropdown(
+                        label="已保存文案",
+                        choices=generated_script_choices(),
+                        interactive=True,
+                        scale=3,
+                    )
+                    refresh_saved_btn = gr.Button("刷新列表", scale=1)
+                    load_saved_btn = gr.Button("载入", variant="primary", scale=1)
+                    delete_saved_btn = gr.Button("删除", scale=1)
+
+                saved_status = gr.Markdown(value=f"已保存 {len(generated_script_choices())} 条文案。")
+                saved_script_text = gr.Textbox(
+                    label="当前文案（可编辑；默认载入第一个版本，想拆别的版本可手动粘贴）",
+                    lines=10,
+                    placeholder="生成或载入文案后，这里会出现可继续加工的文案。",
+                )
+
+                with gr.Row():
+                    dreamina_max_seconds = gr.Slider(
+                        label="Seedance 单段最长秒数（模板固定优先15秒，保留此项兼容旧界面）",
+                        minimum=5,
+                        maximum=15,
+                        value=15,
+                        step=1,
+                    )
+                    dreamina_model = gr.Dropdown(
+                        label="Seedance 模型",
+                        choices=["seedance2.0fast", "seedance2.0", "seedance2.0fast_vip", "seedance2.0_vip"],
+                        value="seedance2.0fast",
+                        interactive=True,
+                    )
+                    seedance_template_note = gr.Textbox(
+                        label="模板说明（固定使用猫狗科普日系二维动画模板，当前不需要手填）",
+                        value="Seedance 2.0，全能参考入口文生视频，16:9横屏，温馨治愈日系二维手绘动画，自动进行猫狗行为/情绪/轻科普画面对位；视频内不生成字幕和旁白。",
+                        scale=3,
+                    )
+                split_dreamina_btn = gr.Button("🎬 拆分为 Seedance 2.0 动画分镜提示词", variant="primary")
+                with gr.Row():
+                    seedance_project_dropdown = gr.Dropdown(
+                        label="导入到项目",
+                        choices=project_choices(),
+                        value=active_project_id(),
+                        interactive=True,
+                        scale=3,
+                    )
+                    refresh_projects_btn = gr.Button("刷新项目", scale=1)
+                    import_seedance_queue_btn = gr.Button("📥 一键导入到项目文生视频队列", variant="secondary", scale=2)
+                with gr.Row():
+                    seedance_new_project_name = gr.Textbox(
+                        label="新建独立项目名称（可选，不填则按文案自动命名）",
+                        placeholder="例如：猫咪踩奶科普动画",
+                        scale=3,
+                    )
+                    create_project_import_btn = gr.Button("🆕 新建独立项目并导入", variant="primary", scale=2)
+                seedance_import_status = gr.Markdown()
+                dreamina_prompts_output = gr.Markdown(label="Seedance 2.0 提示词")
+                dreamina_queue_json = gr.Textbox(
+                    label="队列 JSON 草稿（可后续导入 web_app.py 即梦队列页）",
+                    lines=8,
+                )
+
+                refresh_saved_btn.click(
+                    refresh_generated_scripts,
+                    outputs=[gen_saved_dropdown, saved_status],
+                )
+                load_saved_btn.click(
+                    load_saved_generated_script,
+                    inputs=[gen_saved_dropdown],
+                    outputs=[
+                        gen_output,
+                        saved_script_text,
+                        topic_input,
+                        niche_input3,
+                        req_input,
+                        versions_input,
+                        saved_status,
+                    ],
+                )
+                delete_saved_btn.click(
+                    delete_saved_generated_script,
+                    inputs=[gen_saved_dropdown],
+                    outputs=[gen_saved_dropdown, gen_output, saved_script_text, saved_status],
+                )
+                split_dreamina_btn.click(
+                    build_dreamina_prompts,
+                    inputs=[saved_script_text, dreamina_max_seconds, dreamina_model],
+                    outputs=[dreamina_prompts_output, dreamina_queue_json],
+                )
+                refresh_projects_btn.click(
+                    refresh_project_choices,
+                    outputs=[seedance_project_dropdown, seedance_import_status],
+                )
+                import_seedance_queue_btn.click(
+                    import_seedance_queue_to_web_queue,
+                    inputs=[dreamina_queue_json, seedance_project_dropdown],
+                    outputs=[seedance_import_status],
+                )
+                create_project_import_btn.click(
+                    create_project_and_import_seedance_queue,
+                    inputs=[dreamina_queue_json, seedance_new_project_name, saved_script_text],
+                    outputs=[seedance_project_dropdown, seedance_import_status],
+                )
 
             gen_btn.click(
                 run_generate,
-                inputs=[topic_input, niche_input3, req_input, versions_input, api_key_input, base_url_input],
-                outputs=gen_output,
+                inputs=[topic_input, niche_input3, req_input, versions_input, api_key_input, base_url_input, model_input, provider_input],
+                outputs=[gen_output, gen_saved_dropdown, gen_save_status, saved_script_text, saved_status],
             )
 
     gr.Markdown("""
 ---
-**使用流程：** 📥 抖音采集（自动） → 📥 学习爆款（手动补充） → 🗂️ 检索验证 → ✍️ 生成文案
+**使用流程：** 🎬 转录本地视频 → 🗂️ 检索验证 → ✍️ 生成文案
 
 知识库越丰富（建议每个赛道 30+ 条），生成质量越高
 """)
 
 
 if __name__ == "__main__":
-    demo.launch(
-        server_name="0.0.0.0",
-        server_port=7860,
-        share=False,
-        inbrowser=True,
-    )
+    import os
+
+    # 禁用 Gradio 分析和启动事件检查
+    os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
+    os.environ["GRADIO_SERVER_NAME"] = "127.0.0.1"
+    os.environ["GRADIO_SERVER_PORT"] = "7860"
+
+    # 禁用 httpx 代理（解决 502 问题）
+    os.environ["NO_PROXY"] = "localhost,127.0.0.1"
+    os.environ["no_proxy"] = "localhost,127.0.0.1"
+
+    try:
+        # 使用最简单的启动方式
+        demo.launch(
+            server_name="127.0.0.1",
+            server_port=7860,
+            share=False,
+            inbrowser=False
+        )
+    except Exception as e:
+        print(f"\n❌ 启动失败: {e}")
+        print("\n尝试备用启动方式...")
+        # 备用方案：直接启动服务器
+        from gradio import routes
+        import uvicorn
+
+        app = routes.App.create_app(demo)
+        print("\n✅ 服务器已启动: http://127.0.0.1:7860")
+        print("请在浏览器中打开上述地址\n")
+        uvicorn.run(app, host="127.0.0.1", port=7860, log_level="info")

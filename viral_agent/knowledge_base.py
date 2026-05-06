@@ -66,6 +66,15 @@ def add_script(
     print(f"✅ 已存入知识库: {video_id} (点赞: {metadata.get('likes', 0):,})")
 
 
+def has_script(video_id: str) -> bool:
+    """检查指定 video_id 是否已在知识库中。"""
+    if not video_id:
+        return False
+    collection = get_db()
+    result = collection.get(ids=[video_id], include=[])
+    return bool(result.get("ids"))
+
+
 def search_scripts(query: str, n: int = 5, niche: Optional[str] = None) -> list[dict]:
     """语义检索相似爆款文案"""
     collection = get_db()
@@ -90,6 +99,7 @@ def search_scripts(query: str, n: int = 5, niche: Optional[str] = None) -> list[
                 "why_viral": meta.get("why_viral", ""),
                 "likes": meta.get("likes", 0),
                 "analysis": json.loads(meta.get("analysis_json", "{}")),
+                "metadata": meta,
                 "similarity": 1 - results["distances"][0][i],
             })
     return scripts
