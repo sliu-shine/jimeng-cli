@@ -10,6 +10,7 @@ import threading
 import time
 import re
 import uuid
+import subprocess
 from pathlib import Path
 from typing import Optional
 from datetime import datetime
@@ -19,10 +20,10 @@ sys.path.insert(0, str(Path(__file__).parent / "douyin"))
 
 import gradio as gr
 from viral_agent import knowledge_base as kb
-from viral_agent.analyzer import analyze_script
+from viral_agent.analyzer import _call_claude, analyze_script, engagement_level
 from viral_agent.agent import format_generation_report, generate_detailed
 from viral_agent.ai_providers import apply_provider, get_provider, masked_key, provider_choices
-from viral_agent.seedance_prompt_builder import build_seedance_outputs
+from viral_agent.seedance_prompt_builder import build_seedance_outputs, get_channel_choices, get_default_channel_id
 from douyin.douyin_downloader.pipeline import DouyinViralPipeline
 from douyin.douyin_downloader.transcriber import extract_transcript
 from scripts.claude_client import ClaudeClient
@@ -56,7 +57,8 @@ selenium_task = {
     "logs": [],
     "current_account": 0,
     "total_accounts": 0,
-    "active_account_indices": []
+    "active_account_indices": [],
+    "auto_clear_completed_done": False
 }
 
 
@@ -131,6 +133,146 @@ def read_media_metadata(media_path: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def transcript_candidates(media_path: Path) -> list[Path]:
+    return [
+        transcript_path(media_path),
+        media_path.with_suffix(".transcription.json"),
+        media_path.with_suffix(".transcript.json"),
+        media_path.with_suffix(".txt"),
+    ]
+
+
+def transcript_path(media_path: Path) -> Path:
+    return media_path.parent / "transcript.json"
+
+
+def cleaned_transcript_path(media_path: Path) -> Path:
+    return media_path.parent / "cleaned.json"
+
+
+def quality_report_path(media_path: Path) -> Path:
+    return media_path.parent / "quality.json"
+
+
+def legacy_cleaned_transcript_path(media_path: Path) -> Path:
+    return media_path.with_suffix(".cleaned.json")
+
+
+def legacy_quality_report_path(media_path: Path) -> Path:
+    return media_path.with_suffix(".quality.json")
+
+
+def read_transcript_text(media_path: Path) -> tuple[str, Path | None]:
+    for transcript_file in transcript_candidates(media_path):
+        if not transcript_file.exists():
+            continue
+        try:
+            if transcript_file.suffix == ".txt":
+                text = transcript_file.read_text(encoding="utf-8").strip()
+            else:
+                data = json.loads(transcript_file.read_text(encoding="utf-8"))
+                text = str(data.get("text") or data.get("transcript") or "").strip()
+                if not text and isinstance(data.get("segments"), list):
+                    text = "".join(
+                        str(segment.get("text") or "")
+                        for segment in data["segments"]
+                        if isinstance(segment, dict)
+                    ).strip()
+        except (OSError, json.JSONDecodeError):
+            continue
+        if text:
+            return text, transcript_file
+    return "", None
+
+
+def read_cleaned_transcript_text(media_path: Path) -> tuple[str, Path | None, dict]:
+    clean_file = next(
+        (path for path in [cleaned_transcript_path(media_path), legacy_cleaned_transcript_path(media_path)] if path.exists()),
+        None,
+    )
+    if not clean_file:
+        return "", None, {}
+    try:
+        data = json.loads(clean_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "", None, {}
+    if not isinstance(data, dict):
+        return "", None, {}
+    text = str(data.get("cleaned_text") or data.get("text") or "").strip()
+    return (text, clean_file, data) if text else ("", None, data)
+
+
+def read_import_transcript_text(media_path: Path) -> tuple[str, Path | None, dict]:
+    cleaned_text, cleaned_file, cleaned_data = read_cleaned_transcript_text(media_path)
+    if cleaned_text and cleaned_file:
+        return cleaned_text, cleaned_file, cleaned_data
+    raw_text, raw_file = read_transcript_text(media_path)
+    return raw_text, raw_file, {}
+
+
+def load_quality_report(media_path: Path) -> dict:
+    path = next(
+        (item for item in [quality_report_path(media_path), legacy_quality_report_path(media_path)] if item.exists()),
+        None,
+    )
+    if not path:
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def clean_status_for_media(media_path: Path) -> tuple[str, dict]:
+    quality = load_quality_report(media_path)
+    cleaned_text, _, cleaned_data = read_cleaned_transcript_text(media_path)
+    report = {**quality, **cleaned_data}
+    if report.get("needs_review") or report.get("abnormal"):
+        score = report.get("quality_score", "")
+        return f"⚠️ 异常{f'({score})' if score != '' else ''}", report
+    if cleaned_text:
+        score = report.get("quality_score", "")
+        return f"✅ 已清洗{f'({score})' if score != '' else ''}", report
+    return "🧹 待清洗", report
+
+
+def split_tags(value) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip().lstrip("#") for item in value if str(item).strip()]
+    return [tag.strip().lstrip("#") for tag in re.split(r"[,，#\s]+", str(value or "")) if tag.strip()]
+
+
+def source_account_from_media_path(media_path: Path, root: Path) -> str:
+    try:
+        rel = media_path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return ""
+    return rel.parts[0] if len(rel.parts) > 1 else ""
+
+
+def infer_channel(title: str, tags: list[str], account: str) -> str:
+    text = " ".join([title, account, *tags])
+    if any(word in text for word in ["训练", "训犬", "边界", "纠正", "规矩", "护官"]):
+        return "训犬干货"
+    if any(word in text for word in ["心理", "行为", "为什么", "原因", "冷知识", "科普", "科学养狗", "经验分享", "宇宙"]):
+        return "宠物科普"
+    if any(word in text for word in ["陪伴", "一生", "爱", "治愈", "情绪", "报恩"]):
+        return "情绪陪伴"
+    if any(word in text for word in ["猫", "英短", "蓝猫", "布偶"]):
+        return "猫咪知识"
+    if any(word in text for word in ["第", "犬", "动物解说", "品种"]):
+        return "动物解说"
+    return "抖音短视频"
+
+
+def resolve_media_root(video_dir: str) -> Path:
+    video_path = Path(video_dir or "./douyin_videos")
+    if not video_path.is_absolute():
+        video_path = (ROOT / video_path).resolve()
+    return video_path
+
+
 def dataframe_rows(dataframe):
     """Normalize Gradio Dataframe values across pandas/list return shapes."""
     if dataframe is None:
@@ -140,9 +282,9 @@ def dataframe_rows(dataframe):
     return dataframe
 
 
-def scan_local_videos_with_stats(video_dir: str, status_filter: str = "全部"):
+def scan_local_videos_with_stats(video_dir: str, status_filter: str = "全部", folder_filter: str = "全部"):
     """扫描本地视频，并同步返回最新知识库统计，避免顶部计数停留在旧值。"""
-    video_list, status_msg = scan_local_videos(video_dir, status_filter)
+    video_list, status_msg = scan_local_videos(video_dir, status_filter, folder_filter)
     return video_list, status_msg, kb.get_stats()
 
 
@@ -418,8 +560,8 @@ def split_script_into_segments(script: str, max_seconds: int = 15) -> list[dict]
     return segments
 
 
-def build_dreamina_prompts(script: str, max_seconds: int, model_version: str):
-    return build_seedance_outputs(script, model_version=model_version or "seedance2.0fast")
+def build_dreamina_prompts(script: str, max_seconds: int, model_version: str, channel_id: str):
+    return build_seedance_outputs(script, model_version=model_version or "seedance2.0fast", channel_id=channel_id or None)
 
 
 def refresh_project_choices():
@@ -429,19 +571,29 @@ def refresh_project_choices():
     return gr.update(choices=choices, value=value), status
 
 
-def import_seedance_queue_to_web_queue(queue_json: str, project_id: str):
+def parse_seedance_queue_payload(queue_json: str):
+    content = str(queue_json or "").strip()
+    if not content:
+        return None, "❌ 队列 JSON 草稿为空，请先点击「拆分为 Seedance 2.0 动画分镜提示词」。"
     try:
-        payload = json.loads(str(queue_json or "").strip())
+        payload = json.loads(content)
     except json.JSONDecodeError as exc:
-        return f"❌ 队列 JSON 格式错误：{exc}"
+        return None, f"❌ 队列 JSON 格式错误：{exc}"
+
+    new_segments = payload.get("segments") if isinstance(payload, dict) else payload
+    if not isinstance(new_segments, list) or not new_segments:
+        return None, "❌ 没有可导入的分镜片段。"
+    return new_segments, None
+
+
+def import_seedance_queue_to_web_queue(queue_json: str, project_id: str):
+    new_segments, error = parse_seedance_queue_payload(queue_json)
+    if error:
+        return error
 
     project = project_by_id(project_id or active_project_id())
     if not project:
         return "❌ 请先选择要导入的项目。"
-
-    new_segments = payload.get("segments") if isinstance(payload, dict) else payload
-    if not isinstance(new_segments, list) or not new_segments:
-        return "❌ 没有可导入的分镜片段。"
 
     try:
         queue_path = project_queue_path(str(project["id"]))
@@ -482,6 +634,10 @@ def import_seedance_queue_to_web_queue(queue_json: str, project_id: str):
 
 
 def create_project_and_import_seedance_queue(queue_json: str, project_name: str, script: str):
+    _, error = parse_seedance_queue_payload(queue_json)
+    if error:
+        return gr.update(choices=project_choices(), value=active_project_id()), error
+
     name = str(project_name or "").strip() or default_seedance_project_name(script)
     project = create_web_project(name, description="Seedance 2.0 猫狗科普动画分镜自动创建")
     status = import_seedance_queue_to_web_queue(queue_json, str(project["id"]))
@@ -708,20 +864,56 @@ def run_douyin_pipeline(
 
 
 # ── Tab: 转录本地视频 ──────────────────────────────────────
-def scan_local_videos(video_dir: str, status_filter: str = "全部"):
+def media_folder_choices(video_dir: str):
+    video_path = resolve_media_root(video_dir)
+    if not video_path.exists():
+        return ["全部"]
+
+    folders = []
+    for child in sorted(video_path.iterdir(), key=lambda path: path.name.lower()):
+        if not child.is_dir():
+            continue
+        has_media = any(
+            path.is_file() and path.suffix.lower() in TRANSCRIBABLE_SUFFIXES
+            for path in child.rglob("*")
+        )
+        if has_media:
+            folders.append(child.name)
+    return ["全部", *folders]
+
+
+def refresh_media_folder_filter(video_dir: str):
+    choices = media_folder_choices(video_dir)
+    return gr.update(choices=choices, value="全部")
+
+
+def scan_local_videos(video_dir: str, status_filter: str = "全部", folder_filter: str = "全部"):
     """扫描本地视频目录，返回视频列表和转录状态（递归扫描子目录）"""
-    video_path = Path(video_dir)
+    video_path = resolve_media_root(video_dir)
     if not video_path.exists():
         return [], f"❌ 目录不存在: {video_dir}"
+
+    scan_root = video_path
+    folder_filter = str(folder_filter or "全部")
+    if folder_filter != "全部":
+        candidate = video_path / folder_filter
+        try:
+            candidate.resolve().relative_to(video_path.resolve())
+        except ValueError:
+            return [], f"❌ 无效目录筛选: {folder_filter}"
+        if not candidate.exists() or not candidate.is_dir():
+            return [], f"❌ 筛选目录不存在: {folder_filter}"
+        scan_root = candidate
 
     # 递归扫描所有可转录媒体文件
     video_files = [
         path
-        for path in video_path.rglob("*")
+        for path in scan_root.rglob("*")
         if path.is_file() and path.suffix.lower() in TRANSCRIBABLE_SUFFIXES
     ]
     if not video_files:
-        return [], f"📁 目录中没有找到可转录媒体文件: {video_dir}"
+        suffix = f" / {folder_filter}" if folder_filter != "全部" else ""
+        return [], f"📁 目录中没有找到可转录媒体文件: {video_path}{suffix}"
 
     # 检查每个视频的转录状态
     video_list = []
@@ -729,20 +921,30 @@ def scan_local_videos(video_dir: str, status_filter: str = "全部"):
     untranscribed_count = 0
     imported_count = 0
     unimported_count = 0
+    cleaned_count = 0
+    abnormal_count = 0
+    pending_clean_count = 0
     imported_video_ids = set()
 
     for video_file in sorted(video_files):
         metadata = read_media_metadata(video_file)
         video_id = extract_video_id_from_media(video_file, metadata)
-        transcript_file = video_file.with_suffix('.transcript.json')
-        is_transcribed = transcript_file.exists()
+        transcript_text, transcript_file = read_transcript_text(video_file)
+        is_transcribed = bool(transcript_text and transcript_file)
         status = "✅ 已转录" if is_transcribed else "⏳ 未转录"
+        clean_status, _ = clean_status_for_media(video_file)
         is_imported = kb.has_script(video_id) if is_transcribed else False
         import_status = "✅ 已入库" if is_imported else ("📥 未入库" if is_transcribed else "—")
 
         # 统计数量
         if is_transcribed:
             transcribed_count += 1
+            if "异常" in clean_status:
+                abnormal_count += 1
+            elif "已清洗" in clean_status:
+                cleaned_count += 1
+            else:
+                pending_clean_count += 1
             if is_imported:
                 imported_count += 1
                 imported_video_ids.add(video_id)
@@ -760,6 +962,12 @@ def scan_local_videos(video_dir: str, status_filter: str = "全部"):
             continue
         elif status_filter == "已入库" and not is_imported:
             continue
+        elif status_filter == "待清洗" and (not is_transcribed or "待清洗" not in clean_status):
+            continue
+        elif status_filter == "已清洗" and "已清洗" not in clean_status:
+            continue
+        elif status_filter == "异常" and "异常" not in clean_status:
+            continue
 
         # 获取文件大小
         size_mb = video_file.stat().st_size / (1024 * 1024)
@@ -771,6 +979,7 @@ def scan_local_videos(video_dir: str, status_filter: str = "全部"):
         video_list.append([
             False,  # 选择
             status,  # 状态
+            clean_status,  # 清洗状态
             import_status,  # 入库状态
             str(rel_path),  # 文件名（相对路径，包含子目录）
             f"{size_mb:.1f}",  # 大小(MB)
@@ -782,9 +991,12 @@ def scan_local_videos(video_dir: str, status_filter: str = "全部"):
     shown = len(video_list)
     status_msg = (
         f"✅ 共 {total} 个媒体 | 已转录: {transcribed_count} | 未转录: {untranscribed_count} | "
+        f"已清洗: {cleaned_count} | 待清洗: {pending_clean_count} | 异常: {abnormal_count} | "
         f"已入库文件: {imported_count} | 未入库文件: {unimported_count} | "
         f"知识库唯一视频: {len(imported_video_ids)}"
     )
+    if folder_filter != "全部":
+        status_msg += f" | 目录: {folder_filter}"
     if status_filter != "全部":
         status_msg += f" | 当前显示: {shown} 个（{status_filter}）"
 
@@ -820,9 +1032,9 @@ def transcribe_selected_videos(video_dir: str, dataframe, method: str, api_key: 
 
     for i, row in enumerate(selected, 1):
         status = row[1]    # row[1] 是"状态"列
-        filename = row[3]  # row[3] 是"文件名"列
+        filename = row[4]  # row[4] 是"文件名"列
 
-        video_path = Path(video_dir) / filename
+        video_path = resolve_media_root(video_dir) / filename
 
         # 检查文件是否存在和完整性
         if not video_path.exists():
@@ -899,6 +1111,216 @@ def transcribe_selected_videos(video_dir: str, dataframe, method: str, api_key: 
     yield "\n".join(logs), updated_list
 
 
+def _json_from_ai_text(text: str) -> dict:
+    content = str(text or "").strip()
+    if content.startswith("```"):
+        parts = content.split("```")
+        content = parts[1] if len(parts) > 1 else content
+        if content.startswith("json"):
+            content = content[4:]
+    return json.loads(content.strip())
+
+
+def _clean_transcript_with_ai(
+    transcript: str,
+    title: str,
+    tags: list[str],
+    source_account: str,
+    likes: int,
+) -> dict:
+    prompt = f"""你是短视频中文口播稿校对助手，任务是把 ASR 逐字稿清洗成可用于爆款文案知识库分析的标准文案。
+
+要求：
+1. 只修正常见语音识别错字、同音错字、断句和标点，不要凭空添加新观点。
+2. 如果原始转录和标题/标签明显不匹配，要标记 needs_review=true，不要强行改写。
+3. 宠物领域常见词要优先纠正，例如：遛弯、凑过来、嫌弃、撒娇、贴贴、小型犬、认知、同类、任职/认知等按上下文判断。
+4. 输出文本要保留短视频口播感，适合后续分析钩子、结构、情绪和观点。
+
+【样本信息】
+标题：{title}
+账号：{source_account or "未知"}
+点赞：{likes}
+标签：{"、".join(tags) if tags else "无"}
+
+【原始 ASR 转录】
+{transcript}
+
+请只输出 JSON：
+{{
+  "cleaned_text": "清洗后的完整文案",
+  "quality_score": 0到100的整数,
+  "match_score": 0到100的整数，表示清洗稿与标题/标签是否匹配,
+  "needs_review": true或false,
+  "issues": ["发现的问题，如同音错字较多/疑似音频不匹配/文本过短"],
+  "corrections": [{{"from": "原词", "to": "修正词", "reason": "原因"}}],
+  "summary": "一句话说明清洗结果"
+}}"""
+    result = _json_from_ai_text(_call_claude(prompt))
+    cleaned_text = str(result.get("cleaned_text") or "").strip()
+    quality_score = int(result.get("quality_score", 0) or 0)
+    match_score = int(result.get("match_score", 0) or 0)
+    result["cleaned_text"] = cleaned_text
+    result["quality_score"] = max(0, min(100, quality_score))
+    result["match_score"] = max(0, min(100, match_score))
+    result["needs_review"] = bool(result.get("needs_review")) or quality_score < 60 or match_score < 50 or len(cleaned_text) < 30
+    if not isinstance(result.get("issues"), list):
+        result["issues"] = [str(result.get("issues"))] if result.get("issues") else []
+    if not isinstance(result.get("corrections"), list):
+        result["corrections"] = []
+    return result
+
+
+def clean_selected_transcripts(
+    video_dir: str,
+    dataframe,
+    api_key: str,
+    base_url: str,
+    model: str = "",
+    provider_id: str = "",
+):
+    """清洗选中的已有转录，生成 .cleaned.json 和 .quality.json。"""
+    set_env(api_key, base_url, model, provider_id)
+
+    if dataframe is None or len(dataframe) == 0:
+        yield "❌ 没有媒体可清洗", None
+        return
+
+    selected = [row for row in dataframe_rows(dataframe) if row and row[0]]
+    if not selected:
+        yield "❌ 请至少选择一个已转录媒体", None
+        return
+
+    media_root = resolve_media_root(video_dir)
+    logs = [f"🧹 开始清洗 {len(selected)} 条转录\n"]
+    yield "\n".join(logs), None
+
+    success_count = 0
+    abnormal_count = 0
+    skip_count = 0
+    error_count = 0
+
+    for i, row in enumerate(selected, 1):
+        transcribe_status = str(row[1])
+        filename = str(row[4])
+        media_path = media_root / filename
+
+        if "已转录" not in transcribe_status:
+            logs.append(f"[{i}/{len(selected)}] ⏭️ {filename} - 未转录，跳过")
+            skip_count += 1
+            yield "\n".join(logs), None
+            continue
+
+        raw_text, raw_file = read_transcript_text(media_path)
+        if not raw_text or not raw_file:
+            logs.append(f"[{i}/{len(selected)}] ❌ {filename} - 找不到原始转录")
+            error_count += 1
+            yield "\n".join(logs), None
+            continue
+
+        metadata = read_media_metadata(media_path)
+        title = str(metadata.get("title") or media_path.stem)
+        tags = split_tags(metadata.get("tags", []))
+        likes = int(metadata.get("likes", 0) or 0)
+        source_account = str(
+            metadata.get("source_account")
+            or metadata.get("account_name")
+            or metadata.get("accountName")
+            or metadata.get("author")
+            or source_account_from_media_path(media_path, media_root)
+            or ""
+        )
+
+        logs.append(f"[{i}/{len(selected)}] 🧹 {filename} - AI 清洗中...")
+        yield "\n".join(logs), None
+
+        try:
+            result = _clean_transcript_with_ai(raw_text, title, tags, source_account, likes)
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            payload = {
+                **result,
+                "source_transcript_path": str(raw_file),
+                "media_path": str(media_path),
+                "title": title,
+                "tags": tags,
+                "source_account": source_account,
+                "cleaned_time": now,
+            }
+            cleaned_transcript_path(media_path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            quality_report_path(media_path).write_text(json.dumps({
+                "quality_score": payload.get("quality_score", 0),
+                "match_score": payload.get("match_score", 0),
+                "needs_review": payload.get("needs_review", False),
+                "issues": payload.get("issues", []),
+                "summary": payload.get("summary", ""),
+                "cleaned_path": str(cleaned_transcript_path(media_path)),
+                "updated_time": now,
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            if payload.get("needs_review"):
+                abnormal_count += 1
+                issues = "；".join(str(item) for item in payload.get("issues", [])[:3])
+                logs[-1] = f"[{i}/{len(selected)}] ⚠️ {filename} - 已清洗但标记异常 Q{payload.get('quality_score')} M{payload.get('match_score')} {issues}"
+            else:
+                success_count += 1
+                logs[-1] = f"[{i}/{len(selected)}] ✅ {filename} - 清洗完成 Q{payload.get('quality_score')} M{payload.get('match_score')}"
+        except Exception as exc:
+            logs[-1] = f"[{i}/{len(selected)}] ❌ {filename} - 清洗失败: {exc}"
+            error_count += 1
+
+        yield "\n".join(logs), None
+
+    logs.append(f"\n{'='*60}")
+    logs.append("🧹 清洗完成")
+    logs.append(f"   ✅ 正常: {success_count} 条")
+    logs.append(f"   ⚠️ 异常: {abnormal_count} 条")
+    logs.append(f"   ⏭️ 跳过: {skip_count} 条")
+    logs.append(f"   ❌ 失败: {error_count} 条")
+    logs.append(f"{'='*60}")
+    updated_list, _ = scan_local_videos(video_dir)
+    yield "\n".join(logs), updated_list
+
+
+def inspect_selected_transcript_quality(video_dir: str, dataframe):
+    selected = [row for row in dataframe_rows(dataframe) if row and row[0]]
+    if not selected:
+        return "❌ 请先勾选一个媒体文件。"
+
+    media_root = resolve_media_root(video_dir)
+    row = selected[0]
+    filename = str(row[4])
+    media_path = media_root / filename
+    metadata = read_media_metadata(media_path)
+    raw_text, raw_file = read_transcript_text(media_path)
+    cleaned_text, cleaned_file, cleaned_data = read_cleaned_transcript_text(media_path)
+    quality = load_quality_report(media_path)
+    report = {**quality, **cleaned_data}
+    issues = report.get("issues", [])
+    corrections = report.get("corrections", [])
+
+    preview = cleaned_text or raw_text
+    preview = preview[:500] + ("..." if len(preview) > 500 else "")
+    issue_text = "\n".join(f"- {item}" for item in issues[:10]) if issues else "无"
+    correction_text = "\n".join(
+        f"- {item.get('from', '')} → {item.get('to', '')}：{item.get('reason', '')}"
+        for item in corrections[:10]
+        if isinstance(item, dict)
+    ) or "无"
+
+    return "\n\n".join([
+        f"**媒体文件:** `{media_path}`",
+        f"**标题:** {metadata.get('title', media_path.stem)}",
+        f"**原始转录:** `{raw_file}`" if raw_file else "**原始转录:** 未找到",
+        f"**清洗文件:** `{cleaned_file}`" if cleaned_file else "**清洗文件:** 未生成",
+        f"**质量报告:** `{quality_report_path(media_path)}`" if quality_report_path(media_path).exists() else "**质量报告:** 未生成",
+        f"**质量分:** {report.get('quality_score', '-')}",
+        f"**匹配分:** {report.get('match_score', '-')}",
+        f"**是否异常:** {'是' if report.get('needs_review') or report.get('abnormal') else '否'}",
+        f"**异常原因:**\n{issue_text}",
+        f"**主要修正:**\n{correction_text}",
+        f"**预览:**\n{preview}",
+    ])
+
+
 def import_selected_transcripts(
     video_dir: str,
     dataframe,
@@ -907,6 +1329,7 @@ def import_selected_transcripts(
     base_url: str,
     model: str = "",
     provider_id: str = "",
+    force_reimport: bool = False,
 ):
     """把勾选的已转录/未入库文案分析后导入知识库。"""
     set_env(api_key, base_url, model, provider_id)
@@ -921,19 +1344,22 @@ def import_selected_transcripts(
         return
 
     total = len(selected)
-    logs = [f"🚀 开始导入 {total} 条转录文案到知识库\n"]
+    action = "重新入库" if force_reimport else "导入"
+    logs = [f"🚀 开始{action} {total} 条转录文案到知识库\n"]
     yield "\n".join(logs), None, kb.get_stats()
 
     success_count = 0
     skip_count = 0
     error_count = 0
+    media_root = resolve_media_root(video_dir)
 
     for i, row in enumerate(selected, 1):
         transcribe_status = str(row[1])
-        import_status = str(row[2])
-        filename = str(row[3])
-        video_id = str(row[5] or "")
-        media_path = Path(video_dir) / filename
+        clean_status = str(row[2])
+        import_status = str(row[3])
+        filename = str(row[4])
+        video_id = str(row[6] or "")
+        media_path = media_root / filename
 
         if "已转录" not in transcribe_status:
             logs.append(f"[{i}/{total}] ⏭️ {filename} - 未转录，跳过")
@@ -941,23 +1367,35 @@ def import_selected_transcripts(
             yield "\n".join(logs), None, kb.get_stats()
             continue
 
-        if "已入库" in import_status or kb.has_script(video_id):
+        already_imported = "已入库" in import_status or kb.has_script(video_id)
+        if already_imported and not force_reimport:
             logs.append(f"[{i}/{total}] ⏭️ {filename} - 已入库，跳过")
             skip_count += 1
             yield "\n".join(logs), None, kb.get_stats()
             continue
 
-        transcript_file = media_path.with_suffix(".transcript.json")
-        if not transcript_file.exists():
+        if "待清洗" in clean_status:
+            logs.append(f"[{i}/{total}] ⏭️ {filename} - 尚未清洗，先点击“清洗选中转录”")
+            skip_count += 1
+            yield "\n".join(logs), None, kb.get_stats()
+            continue
+
+        if "异常" in clean_status:
+            logs.append(f"[{i}/{total}] ⏭️ {filename} - 清洗异常，暂不自动入库")
+            skip_count += 1
+            yield "\n".join(logs), None, kb.get_stats()
+            continue
+
+        script, transcript_file, clean_data = read_import_transcript_text(media_path)
+        if not script or not transcript_file:
             logs.append(f"[{i}/{total}] ❌ {filename} - 找不到转录文件")
             error_count += 1
             yield "\n".join(logs), None, kb.get_stats()
             continue
 
         try:
-            with open(transcript_file, "r", encoding="utf-8") as f:
-                transcript = json.load(f)
-            script = str(transcript.get("text", "")).strip()
+            if force_reimport and video_id:
+                kb.delete_script(video_id)
 
             if len(script) < 30:
                 logs.append(f"[{i}/{total}] ⏭️ {filename} - 文案过短，跳过")
@@ -967,31 +1405,57 @@ def import_selected_transcripts(
 
             metadata = read_media_metadata(media_path)
             video_id = video_id or extract_video_id_from_media(media_path, metadata)
-            tags = metadata.get("tags", [])
-            auto_niche = tags[0] if isinstance(tags, list) and tags else ""
-            niche = default_niche.strip() or auto_niche
             likes = int(metadata.get("likes", 0) or 0)
+            tags = split_tags(metadata.get("tags", []))
+            title = str(metadata.get("title") or media_path.stem)
+            source_account = str(
+                metadata.get("source_account")
+                or metadata.get("account_name")
+                or metadata.get("accountName")
+                or metadata.get("author")
+                or source_account_from_media_path(media_path, media_root)
+                or ""
+            )
+            channel = str(
+                default_niche.strip()
+                or metadata.get("channel")
+                or metadata.get("niche")
+                or infer_channel(title, tags, source_account)
+            )
+            level = engagement_level(likes)
 
             logs.append(f"[{i}/{total}] 🧠 {filename} - 分析并入库中...")
             yield "\n".join(logs), None, kb.get_stats()
 
-            analysis = analyze_script(script, likes=likes, niche=niche)
+            analysis = analyze_script(
+                script,
+                likes=likes,
+                niche=channel,
+                source_account=source_account,
+                tags=tags,
+            )
             kb.add_script(
                 video_id=video_id,
                 script=script,
                 analysis=analysis,
                 metadata={
+                    "source": "douyin_webui",
                     "likes": likes,
-                    "niche": niche,
+                    "engagement_level": level,
+                    "niche": channel,
+                    "channel": channel,
                     "platform": "douyin",
+                    "source_account": source_account,
                     "media_path": str(media_path),
                     "transcript_path": str(transcript_file),
-                    "title": metadata.get("title", ""),
+                    "transcript_quality": clean_data.get("quality_score", ""),
+                    "transcript_match_score": clean_data.get("match_score", ""),
+                    "title": title,
                     "description": metadata.get("description", "") or metadata.get("desc", ""),
                     "video_url": metadata.get("video_url", ""),
-                    "author": metadata.get("author", ""),
-                    "media_type": metadata.get("media_type", ""),
-                    "tags": ",".join(tags) if isinstance(tags, list) else str(tags or ""),
+                    "author": metadata.get("author", source_account),
+                    "media_type": metadata.get("media_type", media_path.suffix.lower().lstrip(".")),
+                    "tags": ",".join(tags),
                 },
             )
 
@@ -1019,6 +1483,68 @@ def import_selected_transcripts(
 
     updated_list, _ = scan_local_videos(video_dir)
     yield "\n".join(logs), updated_list, kb.get_stats()
+
+
+def reimport_selected_transcripts(
+    video_dir: str,
+    dataframe,
+    default_niche: str,
+    api_key: str,
+    base_url: str,
+    model: str = "",
+    provider_id: str = "",
+):
+    yield from import_selected_transcripts(
+        video_dir,
+        dataframe,
+        default_niche,
+        api_key,
+        base_url,
+        model,
+        provider_id,
+        force_reimport=True,
+    )
+
+
+def remove_selected_from_kb(video_dir: str, dataframe):
+    """从知识库删除选中的样本，不删除本地媒体/转录文件。"""
+    if dataframe is None or len(dataframe) == 0:
+        return "❌ 没有媒体可出库", None, kb.get_stats()
+
+    selected = [row for row in dataframe_rows(dataframe) if row and row[0]]
+    if not selected:
+        return "❌ 请至少选择一个已入库媒体", None, kb.get_stats()
+
+    media_root = resolve_media_root(video_dir)
+    logs = [f"🗑️ 开始出库 {len(selected)} 条样本\n"]
+    removed = 0
+    skipped = 0
+
+    for i, row in enumerate(selected, 1):
+        filename = str(row[4])
+        video_id = str(row[6] or "")
+        media_path = media_root / filename
+        metadata = read_media_metadata(media_path)
+        video_id = video_id or extract_video_id_from_media(media_path, metadata)
+
+        if kb.delete_script(video_id):
+            removed += 1
+            metadata["imported_to_kb"] = False
+            metadata["removed_from_kb_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            metadata["kb_video_id"] = video_id
+            metadata_path = media_path.with_suffix(".json")
+            if metadata_path.exists():
+                metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+            logs.append(f"[{i}/{len(selected)}] ✅ {filename} - 已出库")
+        else:
+            skipped += 1
+            logs.append(f"[{i}/{len(selected)}] ⏭️ {filename} - 知识库中不存在，跳过")
+
+    logs.append(f"\n{'='*60}")
+    logs.append(f"出库完成：删除 {removed} 条，跳过 {skipped} 条")
+    logs.append(f"{'='*60}")
+    updated_list, _ = scan_local_videos(video_dir)
+    return "\n".join(logs), updated_list, kb.get_stats()
 
 
 # ── Tab: Selenium 抖音采集 ──────────────────────────────────
@@ -1163,6 +1689,106 @@ def format_selenium_logs():
     ])
 
 
+def list_recent_selenium_media(save_path: str, limit: int = 30):
+    """列出最近下载的媒体，方便定位错配音频和对应元数据。"""
+    base_dir = Path(save_path or "./douyin_videos").expanduser()
+    if not base_dir.is_absolute():
+        base_dir = (ROOT / base_dir).resolve()
+    if not base_dir.exists():
+        return [], f"目录不存在：{base_dir}"
+
+    media_files = [
+        path for path in base_dir.rglob("*")
+        if path.is_file() and path.suffix.lower() in {".m4a", ".mp4", ".mp3", ".aac", ".wav"}
+    ]
+    media_files.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+
+    rows = []
+    for path in media_files[: int(limit or 30)]:
+        metadata = read_media_metadata(path)
+        rel_path = path.relative_to(base_dir)
+        download = metadata.get("download") if isinstance(metadata, dict) else {}
+        fallback_reason = metadata.get("fallback_reason", "") if isinstance(metadata, dict) else ""
+        audio_candidates = int(metadata.get("audio_candidates_count") or 0) if isinstance(metadata, dict) else 0
+        method = download.get("method") if isinstance(download, dict) else ""
+        status = "✅ 正常"
+        if fallback_reason:
+            status = "🛟 兜底"
+        elif audio_candidates > 1:
+            status = "⚠️ 多音频"
+
+        rows.append([
+            False,
+            status,
+            path.suffix.lower().lstrip("."),
+            metadata.get("video_id", "") if isinstance(metadata, dict) else "",
+            metadata.get("title", "") if isinstance(metadata, dict) else "",
+            metadata.get("author", "") if isinstance(metadata, dict) else "",
+            str(audio_candidates),
+            str(method or ("browser" if metadata else "")),
+            time.strftime("%H:%M:%S", time.localtime(path.stat().st_mtime)),
+            str(rel_path),
+            str(path),
+        ])
+
+    return rows, f"已列出最近 {len(rows)} 个媒体文件：{base_dir}"
+
+
+def refresh_selenium_media_locator(save_path: str):
+    return list_recent_selenium_media(save_path)
+
+
+def selected_media_path(rows) -> Path | None:
+    for row in dataframe_rows(rows):
+        if row and row[0] and len(row) >= 11:
+            path = Path(str(row[10] or ""))
+            if path.exists():
+                return path
+    return None
+
+
+def reveal_selected_selenium_media(rows):
+    path = selected_media_path(rows)
+    if not path:
+        return "❌ 请先在最近下载文件表里勾选一个存在的文件。"
+
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(["open", "-R", str(path)], check=False)
+        elif os.name == "nt":
+            subprocess.run(["explorer", "/select,", str(path)], check=False)
+        else:
+            subprocess.run(["xdg-open", str(path.parent)], check=False)
+    except Exception as exc:
+        return f"❌ 打开文件位置失败：{exc}"
+
+    return f"✅ 已定位文件：{path}\n\n元数据：{path.with_suffix('.json')}"
+
+
+def inspect_selected_selenium_media(rows):
+    path = selected_media_path(rows)
+    if not path:
+        return "❌ 请先勾选一个媒体文件。"
+
+    metadata = read_media_metadata(path)
+    media_transcript_path = transcript_path(path)
+    summary = [
+        f"**媒体文件:** `{path}`",
+        f"**元数据:** `{path.with_suffix('.json')}`",
+        f"**转录文件:** `{media_transcript_path}`" if media_transcript_path.exists() else "**转录文件:** 未生成",
+        "",
+        f"**video_id:** `{metadata.get('video_id', '')}`",
+        f"**标题:** {metadata.get('title', '')}",
+        f"**账号:** {metadata.get('author') or metadata.get('account_name', '')}",
+        f"**下载方式:** {(metadata.get('download') or {}).get('method', 'browser') if metadata else '未知'}",
+        f"**音频候选数:** {metadata.get('audio_candidates_count', '')}",
+        f"**兜底原因:** {metadata.get('fallback_reason', '') or '无'}",
+        f"**校验:** {metadata.get('validation', '')}",
+        f"**原视频链接:** {metadata.get('video_url', '')}",
+    ]
+    return "\n\n".join(summary)
+
+
 def start_selenium_download(rows, save_path: str, min_likes: int,
                            organize_by_tag: bool, save_metadata: bool, auto_next: bool):
     """启动 Selenium 下载任务"""
@@ -1189,6 +1815,7 @@ def start_selenium_download(rows, save_path: str, min_likes: int,
     selenium_task["current_account"] = 0
     selenium_task["total_accounts"] = len(user_urls)
     selenium_task["active_account_indices"] = [idx for idx, _ in active_accounts]
+    selenium_task["auto_clear_completed_done"] = False
 
     add_selenium_log("info", f"启动下载任务，共 {len(user_urls)} 个账号")
     if save_metadata:
@@ -1293,6 +1920,20 @@ def get_selenium_status(rows):
         if account_index < len(accounts):
             accounts[account_index]["status"] = status.get("status", accounts[account_index].get("status", "pending"))
             accounts[account_index]["progress"] = status.get("progress", accounts[account_index].get("progress", 0))
+
+    if (
+        not selenium_task["is_running"]
+        and selenium_task["accounts_status"]
+        and not selenium_task.get("auto_clear_completed_done")
+    ):
+        before_count = len(accounts)
+        accounts = [acc for acc in accounts if acc.get("status") != "completed"]
+        removed_count = before_count - len(accounts)
+        if removed_count:
+            save_selenium_accounts(accounts)
+            add_selenium_log("info", f"已自动清除 {removed_count} 个已完成账号")
+        selenium_task["auto_clear_completed_done"] = True
+
     current_rows = selenium_accounts_to_rows(accounts)
 
     # 格式化状态信息
@@ -1387,10 +2028,19 @@ with gr.Blocks(title="爆款文案智能体") as demo:
                         value="./douyin_videos",
                         placeholder="./douyin_videos"
                     )
+                    with gr.Row():
+                        folder_filter = gr.Dropdown(
+                            label="目录筛选",
+                            choices=media_folder_choices("./douyin_videos"),
+                            value="全部",
+                            interactive=True,
+                            scale=3,
+                        )
+                        refresh_folder_filter_btn = gr.Button("刷新目录", variant="secondary", scale=1)
 
                     status_filter = gr.Radio(
                         label="状态筛选",
-                        choices=["全部", "已转录", "未转录", "未入库", "已入库"],
+                        choices=["全部", "已转录", "未转录", "待清洗", "已清洗", "异常", "未入库", "已入库"],
                         value="全部",
                         info="筛选要显示的视频"
                     )
@@ -1412,6 +2062,8 @@ with gr.Blocks(title="爆款文案智能体") as demo:
                     )
 
                     transcribe_btn = gr.Button("🚀 开始转录选中视频", variant="primary", size="lg")
+                    clean_transcript_btn = gr.Button("🧹 清洗选中转录", variant="secondary", size="lg")
+                    inspect_quality_btn = gr.Button("🔎 查看清洗/异常报告", variant="secondary")
 
                     import_niche_input = gr.Dropdown(
                         label="默认赛道",
@@ -1421,13 +2073,15 @@ with gr.Blocks(title="爆款文案智能体") as demo:
                         info="导入知识库时使用的赛道标签，可手动输入自定义赛道"
                     )
                     import_kb_btn = gr.Button("📥 导入知识库", variant="secondary", size="lg")
+                    reimport_kb_btn = gr.Button("🔁 重新入库选中", variant="secondary")
+                    remove_kb_btn = gr.Button("🗑️ 出库选中", variant="secondary")
 
                 with gr.Column(scale=2):
                     scan_status = gr.Textbox(label="扫描状态", lines=1, interactive=False)
                     video_list_df = gr.Dataframe(
-                        headers=["选择", "转录状态", "入库状态", "文件名", "大小(MB)", "视频ID", "路径"],
-                        datatype=["bool", "str", "str", "str", "str", "str", "str"],
-                        column_count=(7, "fixed"),
+                        headers=["选择", "转录状态", "清洗状态", "入库状态", "文件名", "大小(MB)", "视频ID", "路径"],
+                        datatype=["bool", "str", "str", "str", "str", "str", "str", "str"],
+                        column_count=(8, "fixed"),
                         label="视频列表",
                         interactive=True,
                         wrap=True
@@ -1436,6 +2090,13 @@ with gr.Blocks(title="爆款文案智能体") as demo:
             transcribe_log = gr.Textbox(
                 label="转录日志",
                 lines=15,
+                max_lines=25,
+                interactive=False
+            )
+
+            clean_log = gr.Textbox(
+                label="清洗日志 / 异常报告",
+                lines=12,
                 max_lines=25,
                 interactive=False
             )
@@ -1450,14 +2111,26 @@ with gr.Blocks(title="爆款文案智能体") as demo:
             # 扫描视频
             scan_btn.click(
                 scan_local_videos_with_stats,
-                inputs=[video_dir_input, status_filter],
+                inputs=[video_dir_input, status_filter, folder_filter],
                 outputs=[video_list_df, scan_status, kb_stats]
+            )
+
+            refresh_folder_filter_btn.click(
+                refresh_media_folder_filter,
+                inputs=[video_dir_input],
+                outputs=[folder_filter]
             )
 
             # 状态筛选变化时重新扫描
             status_filter.change(
                 scan_local_videos_with_stats,
-                inputs=[video_dir_input, status_filter],
+                inputs=[video_dir_input, status_filter, folder_filter],
+                outputs=[video_list_df, scan_status, kb_stats]
+            )
+
+            folder_filter.change(
+                scan_local_videos_with_stats,
+                inputs=[video_dir_input, status_filter, folder_filter],
                 outputs=[video_list_df, scan_status, kb_stats]
             )
 
@@ -1468,9 +2141,33 @@ with gr.Blocks(title="爆款文案智能体") as demo:
                 outputs=[transcribe_log, video_list_df]
             )
 
+            clean_transcript_btn.click(
+                clean_selected_transcripts,
+                inputs=[video_dir_input, video_list_df, api_key_input, base_url_input, model_input, provider_input],
+                outputs=[clean_log, video_list_df]
+            )
+
+            inspect_quality_btn.click(
+                inspect_selected_transcript_quality,
+                inputs=[video_dir_input, video_list_df],
+                outputs=[clean_log]
+            )
+
             import_kb_btn.click(
                 import_selected_transcripts,
                 inputs=[video_dir_input, video_list_df, import_niche_input, api_key_input, base_url_input, model_input, provider_input],
+                outputs=[import_log, video_list_df, kb_stats]
+            )
+
+            reimport_kb_btn.click(
+                reimport_selected_transcripts,
+                inputs=[video_dir_input, video_list_df, import_niche_input, api_key_input, base_url_input, model_input, provider_input],
+                outputs=[import_log, video_list_df, kb_stats]
+            )
+
+            remove_kb_btn.click(
+                remove_selected_from_kb,
+                inputs=[video_dir_input, video_list_df],
                 outputs=[import_log, video_list_df, kb_stats]
             )
 
@@ -1515,6 +2212,26 @@ with gr.Blocks(title="爆款文案智能体") as demo:
                         max_lines=20,
                         interactive=False
                     )
+                    gr.Markdown("### 最近下载文件")
+                    with gr.Row():
+                        selenium_refresh_media_btn = gr.Button("刷新文件列表", variant="secondary")
+                        selenium_reveal_media_btn = gr.Button("在 Finder 中定位", variant="secondary")
+                    selenium_media_status = gr.Textbox(
+                        label="文件定位状态",
+                        value="点击刷新文件列表查看最近下载结果",
+                        lines=2,
+                        interactive=False
+                    )
+                    selenium_media_df = gr.Dataframe(
+                        headers=["选择", "风险", "类型", "视频ID", "标题", "账号", "音频候选", "下载方式", "时间", "相对路径", "完整路径"],
+                        datatype=["bool", "str", "str", "str", "str", "str", "str", "str", "str", "str", "str"],
+                        column_count=(11, "fixed"),
+                        label="最近下载媒体",
+                        interactive=True,
+                        wrap=True
+                    )
+                    selenium_media_detail = gr.Markdown(value="勾选一行后点击查看元数据。")
+                    selenium_inspect_media_btn = gr.Button("查看选中文件元数据", variant="secondary")
 
                 with gr.Column(scale=1):
                     gr.Markdown("### 下载设置")
@@ -1527,7 +2244,7 @@ with gr.Blocks(title="爆款文案智能体") as demo:
 
                     selenium_min_likes = gr.Number(
                         label="最低点赞数",
-                        value=1000,
+                        value=2000,
                         minimum=0,
                         info="只下载点赞数超过此值的视频"
                     )
@@ -1593,6 +2310,24 @@ with gr.Blocks(title="爆款文案智能体") as demo:
             selenium_clear_all_btn.click(
                 clear_all_selenium_accounts,
                 outputs=[selenium_accounts_df, selenium_account_stats_display, selenium_log_display]
+            )
+
+            selenium_refresh_media_btn.click(
+                refresh_selenium_media_locator,
+                inputs=[selenium_save_path],
+                outputs=[selenium_media_df, selenium_media_status]
+            )
+
+            selenium_reveal_media_btn.click(
+                reveal_selected_selenium_media,
+                inputs=[selenium_media_df],
+                outputs=[selenium_media_status]
+            )
+
+            selenium_inspect_media_btn.click(
+                inspect_selected_selenium_media,
+                inputs=[selenium_media_df],
+                outputs=[selenium_media_detail]
             )
 
             # 定时刷新状态
@@ -1698,10 +2433,13 @@ with gr.Blocks(title="爆款文案智能体") as demo:
                         value="seedance2.0fast",
                         interactive=True,
                     )
-                    seedance_template_note = gr.Textbox(
-                        label="模板说明（固定使用猫狗科普日系二维动画模板，当前不需要手填）",
-                        value="Seedance 2.0，全能参考入口文生视频，16:9横屏，温馨治愈日系二维手绘动画，自动进行猫狗行为/情绪/轻科普画面对位；视频内不生成字幕和旁白。",
-                        scale=3,
+                    channel_dropdown = gr.Dropdown(
+                        label="频道画风",
+                        choices=get_channel_choices(),
+                        value=get_default_channel_id(),
+                        interactive=True,
+                        info="选择不同频道使用不同的画风模板",
+                        scale=2,
                     )
                 split_dreamina_btn = gr.Button("🎬 拆分为 Seedance 2.0 动画分镜提示词", variant="primary")
                 with gr.Row():
@@ -1752,7 +2490,7 @@ with gr.Blocks(title="爆款文案智能体") as demo:
                 )
                 split_dreamina_btn.click(
                     build_dreamina_prompts,
-                    inputs=[saved_script_text, dreamina_max_seconds, dreamina_model],
+                    inputs=[saved_script_text, dreamina_max_seconds, dreamina_model, channel_dropdown],
                     outputs=[dreamina_prompts_output, dreamina_queue_json],
                 )
                 refresh_projects_btn.click(

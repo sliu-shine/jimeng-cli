@@ -2,10 +2,10 @@
   "dreamina": "/Users/sliu/.local/bin/dreamina",
   "queue_file": "/Users/sliu/web-project/rich-projects/jimeng-cli/.webui/global.queue.json",
   "output_root": "/Users/sliu/web-project/rich-projects/jimeng-cli/web-output",
-  "state_file": "/Users/sliu/web-project/rich-projects/jimeng-cli/web-output/queue-state.json",
+  "state_file": "/Users/sliu/web-project/rich-projects/jimeng-cli/.webui/queue-state.json",
   "poll_interval": 30,
   "timeout_seconds": 10800,
   "resume": false,
   "stop_on_failure": false,
-  "active_project_id": "project-78ca9005a2"
+  "active_project_id": "project-cba9bd301f"
 }

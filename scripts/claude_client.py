@@ -54,7 +54,11 @@ class ClaudeClient:
 
         with httpx.Client(timeout=120.0) as client:
             response = client.post(url, headers=headers, json=payload)
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                detail = response.text[:500] if response.text else str(exc)
+                raise RuntimeError(f"Claude API 请求失败 {response.status_code}: {detail}") from exc
             return response.json()
 
 

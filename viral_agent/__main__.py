@@ -33,7 +33,7 @@ def main():
     learn_src.add_argument("--text", help="文案JSON文件路径")
     learn_src.add_argument("--account", help="抖音账号 sec_user_id")
     learn_parser.add_argument("--niche", default="", help="赛道分类（如：美食、情感、干货）")
-    learn_parser.add_argument("--min-likes", type=int, default=10000, help="最低点赞数筛选")
+    learn_parser.add_argument("--min-likes", type=int, default=2000, help="最低点赞数筛选")
     learn_parser.add_argument("--max-videos", type=int, default=20, help="最多处理视频数")
     learn_parser.add_argument("--no-groq", action="store_true", help="使用本地Whisper而不是Groq")
 

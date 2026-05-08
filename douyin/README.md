@@ -24,8 +24,9 @@ douyin/
 **特点**：
 - ✅ 自动化浏览器操作，模拟真实用户行为
 - ✅ 支持采集视频标题和标签
-- ✅ 支持按标签分类保存
-- ✅ 智能文件命名：`[标签]标题_videoId_点赞数.mp4`
+- ✅ 按对标账号命名一级目录：`douyin_videos/账号名/视频标题/文件`
+- ✅ 支持 `.m4a`、`.mp3`、`.mp4` 等媒体文件
+- ✅ 多音频候选或无声视频流时优先用 yt-dlp 按视频页兜底下载音频
 - ✅ 自动保存元数据 JSON 文件
 - ✅ **支持多账号连续下载**
 
@@ -74,11 +75,11 @@ https://www.douyin.com/user/xxx3
 # 浏览器会保持打开状态，直到所有账号处理完毕
 ```
 
-**文件命名规则**：
+**文件目录规则**：
 
-- 格式：`[标签]标题_videoId_点赞数.mp4`
-- 示例：`[舞蹈]超燃街舞表演_7123456789_125000.mp4`
-- 如果有标签，会按标签创建子目录分类存储
+- 格式：`douyin_videos/账号名/视频标题/[点赞]_标题_videoId.m4a`
+- 示例：`douyin_videos/狗狗执行官-Kiki/给小狗听一下这首歌/[17w赞]_给小狗听一下这首歌_7635636890410044722.m4a`
+- 如果浏览器只能抓到分离流视频，脚本会跳过无声视频并尝试下载对应音频
 - 每个视频会生成对应的 `.json` 元数据文件
 
 ### 2. 视频分析
@@ -90,8 +91,23 @@ https://www.douyin.com/user/xxx3
 将下载的视频导入到爆款文案知识库：
 
 ```bash
-python douyin/import_videos.py
+# 推荐先预检：不调用 AI、不写知识库
+python douyin/import_videos.py douyin_videos --no-transcribe --dry-run
+
+# 使用已有 .transcription.json/.transcript.json/.txt 导入，不重新转录
+python douyin/import_videos.py douyin_videos --no-transcribe
+
+# 小批量试跑：只分析某个账号的前 5 条
+python douyin/import_videos.py douyin_videos --no-transcribe --account "狗狗执行官-Kiki" --limit 5
 ```
+
+导入脚本会递归扫描 `.mp4`、`.m4a`、`.mp3`、`.aac`、`.wav`，并按 `video_id` 去重；同一条视频同时有 `.mp4` 和 `.mp3` 时，优先选已有转录的音频文件。导入时会把点赞/互动数、互动等级、来源账号、频道分类、媒体路径和转录路径写入知识库 metadata。
+
+支持的转录文件名：
+
+- `视频名.transcription.json`
+- `视频名.transcript.json`
+- `视频名.txt`
 
 ## 注意事项
 

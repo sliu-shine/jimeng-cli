@@ -283,7 +283,7 @@ def extract_transcript(
 
     # 3. 保存结果
     if save_json:
-        transcript_file = video_path.with_suffix('.transcript.json')
+        transcript_file = video_path.parent / "transcript.json"
         with open(transcript_file, 'w', encoding='utf-8') as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
         print(f"逐字稿已保存: {transcript_file}")
@@ -322,10 +322,16 @@ def batch_extract_transcripts(
     for video_path in video_files:
         try:
             # 检查是否已有逐字稿
-            transcript_file = video_path.with_suffix('.transcript.json')
+            transcript_file = video_path.parent / "transcript.json"
+            legacy_transcript_file = video_path.with_suffix('.transcript.json')
             if transcript_file.exists():
                 print(f"跳过已处理: {video_path.name}")
                 with open(transcript_file, 'r', encoding='utf-8') as f:
+                    results[video_path.name] = json.load(f)
+                continue
+            if legacy_transcript_file.exists():
+                print(f"跳过已处理: {video_path.name}")
+                with open(legacy_transcript_file, 'r', encoding='utf-8') as f:
                     results[video_path.name] = json.load(f)
                 continue
 

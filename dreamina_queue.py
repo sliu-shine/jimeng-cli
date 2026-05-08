@@ -17,6 +17,10 @@ from pathlib import Path
 from typing import Any
 
 
+ROOT = Path(__file__).resolve().parent
+APP_DIR = ROOT / ".webui"
+PROJECTS_DIR = APP_DIR / "projects"
+PROJECTS_INDEX_FILE = APP_DIR / "projects.json"
 TERMINAL_STATUSES = {"success", "fail", "failed", "rejected", "banned", "error", "cancelled"}
 SUCCESS_STATUSES = {"success"}
 FAIL_STATUSES = {"fail", "failed", "rejected", "banned", "error", "cancelled"}
@@ -659,9 +663,9 @@ def write_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def build_task_records(entries: list[dict[str, Any]], output_root: Path) -> list[dict[str, Any]]:
+def build_task_records(entries: list[dict[str, Any]], output_root: Path, start_index: int = 1) -> list[dict[str, Any]]:
     tasks: list[dict[str, Any]] = []
-    for index, entry in enumerate(entries, start=1):
+    for index, entry in enumerate(entries, start=start_index):
         command = str(entry["command"])
         segment_name = str(entry.get("name") or f"片段{index}")
         project_id = str(entry.get("project_id") or "")
@@ -721,14 +725,120 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
     path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def load_json(path: Path, default: Any) -> Any:
+    try:
+        content = path.read_text(encoding="utf-8").strip()
+        if not content:
+            return default
+        return json.loads(content)
+    except (json.JSONDecodeError, UnicodeDecodeError, FileNotFoundError):
+        return default
+
+
+def save_json(path: Path, payload: Any) -> None:
+    ensure_dir(path.parent)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def project_folder_name(project_id: str) -> str:
+    index = load_json(PROJECTS_INDEX_FILE, {})
+    for project in index.get("projects") or []:
+        if isinstance(project, dict) and str(project.get("id") or "") == project_id and project.get("folder"):
+            return str(project["folder"])
+    return project_id
+
+
+def project_queue_file(project_id: str) -> Path:
+    return PROJECTS_DIR / project_folder_name(project_id) / "queue.json"
+
+
+def task_is_terminal(task: dict[str, Any]) -> bool:
+    return str(task.get("status") or "").lower() in TERMINAL_STATUSES
+
+
+def task_retry_requested(task: dict[str, Any]) -> bool:
+    return bool(str(task.get("manual_retry_requested_at") or "").strip())
+
+
+def merge_task_record(existing: dict[str, Any], incoming: dict[str, Any]) -> None:
+    existing_status = str(existing.get("status") or "").lower()
+    incoming_status = str(incoming.get("status") or "").lower()
+    if task_retry_requested(incoming):
+        existing.update(incoming)
+        return
+    if existing_status == "running" and incoming_status in {"", "pending"}:
+        # A stale on-disk pending record must not hide the task currently being
+        # submitted or polled by this runner.
+        return
+    if existing_status == "success" and incoming_status != "success":
+        return
+    if incoming_status == "success":
+        existing.update(incoming)
+        return
+    if task_is_terminal(existing) and not task_is_terminal(incoming):
+        return
+    existing.update(incoming)
+
+
+def sync_project_queue_task(task: dict[str, Any]) -> None:
+    project_id = str(task.get("project_id") or "").strip()
+    segment_id = str(task.get("segment_id") or "").strip()
+    if not project_id or not segment_id:
+        return
+    queue_path = project_queue_file(project_id)
+    document = load_json(queue_path, {})
+    segments = document.get("segments")
+    if not isinstance(segments, list):
+        return
+    changed = False
+    for segment in segments:
+        if not isinstance(segment, dict) or str(segment.get("id") or "") != segment_id:
+            continue
+        for key in [
+            "status",
+            "submit_id",
+            "gen_status",
+            "fail_reason",
+            "started_at",
+            "finished_at",
+            "download_dir",
+            "urls",
+            "retry_count",
+            "manual_retry_requested_at",
+        ]:
+            if key in task:
+                segment[key] = task.get(key)
+        changed = True
+        break
+    if changed:
+        document["updated_at"] = now_iso()
+        save_json(queue_path, document)
+
+
+def sync_project_queues_from_state(state: dict[str, Any]) -> None:
+    for task in state.get("tasks") or []:
+        if isinstance(task, dict):
+            sync_project_queue_task(task)
+
+
 def prepare_state(args: argparse.Namespace, entries: list[dict[str, Any]]) -> dict[str, Any]:
     output_root = args.output_root.resolve()
-    if args.resume and args.state_file.exists():
+    if args.state_file.exists():
         state = load_state(args.state_file)
-        existing_signatures = [(task.get("project_id"), task.get("segment_id"), task["command"]) for task in state.get("tasks", [])]
-        current_signatures = [(entry.get("project_id"), entry.get("id"), entry["command"]) for entry in entries]
-        if existing_signatures != current_signatures:
-            raise SystemExit("`--resume` 使用的队列文件和已有 state 不一致，已拒绝继续。")
+        existing = {task_signature(task) for task in state.get("tasks", [])}
+        existing_ids = {
+            task_identity(task) for task in state.get("tasks", [])
+            if task_identity(task)[1]
+        }
+        new_entries = [
+            entry for entry in entries
+            if entry_signature(entry) not in existing
+            and entry_identity(entry) not in existing_ids
+        ]
+        if new_entries:
+            next_index = len(state.get("tasks", [])) + 1
+            state.setdefault("tasks", []).extend(build_task_records(new_entries, output_root, start_index=next_index))
+            update_state(args.state_file.resolve(), state)
         return state
 
     state = {
@@ -744,6 +854,102 @@ def prepare_state(args: argparse.Namespace, entries: list[dict[str, Any]]) -> di
     }
     save_state(args.state_file, state)
     return state
+
+
+def task_signature(task: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(task.get("project_id") or ""),
+        str(task.get("segment_id") or ""),
+        str(task.get("command") or ""),
+    )
+
+
+def task_identity(task: dict[str, Any]) -> tuple[str, str]:
+    return (
+        str(task.get("project_id") or ""),
+        str(task.get("segment_id") or ""),
+    )
+
+
+def entry_signature(entry: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(entry.get("project_id") or ""),
+        str(entry.get("id") or ""),
+        str(entry.get("command") or ""),
+    )
+
+
+def entry_identity(entry: dict[str, Any]) -> tuple[str, str]:
+    return (
+        str(entry.get("project_id") or ""),
+        str(entry.get("id") or ""),
+    )
+
+
+def merge_external_state_tasks(state: dict[str, Any], state_path: Path) -> int:
+    external_state = load_state(state_path)
+    external_tasks = external_state.get("tasks")
+    if not isinstance(external_tasks, list):
+        return 0
+
+    tasks = state.setdefault("tasks", [])
+    by_identity = {task_identity(task): task for task in tasks if task_identity(task)[1]}
+    by_signature = {task_signature(task): task for task in tasks}
+    added = []
+    updated = 0
+    for task in external_tasks:
+        target = by_identity.get(task_identity(task)) or by_signature.get(task_signature(task))
+        if target:
+            before = json.dumps(target, ensure_ascii=False, sort_keys=True)
+            merge_task_record(target, task)
+            after = json.dumps(target, ensure_ascii=False, sort_keys=True)
+            if before != after:
+                updated += 1
+            continue
+        added.append(task)
+    if not added:
+        if updated:
+            log(f"合并 {updated} 个外部状态更新。")
+        return 0
+
+    tasks.extend(added)
+    log(f"合并 {len(added)} 个外部追加任务，更新 {updated} 个已有任务。")
+    return len(added)
+
+
+def merge_external_state_before_save(state: dict[str, Any], state_path: Path) -> None:
+    if state_path.exists():
+        merge_external_state_tasks(state, state_path)
+
+
+def append_new_tasks_from_queue(args: argparse.Namespace, state: dict[str, Any], state_path: Path) -> int:
+    merge_external_state_tasks(state, state_path)
+    try:
+        entries = read_queue_entries(args.queue_file)
+    except Exception as exc:
+        log(f"刷新队列文件失败，保留当前队列继续执行: {exc}")
+        return 0
+
+    existing = {task_signature(task) for task in state.get("tasks", [])}
+    existing_ids = {
+        task_identity(task) for task in state.get("tasks", [])
+        if task_identity(task)[1]
+    }
+    new_entries = [
+        entry for entry in entries
+        if entry_signature(entry) not in existing
+        and entry_identity(entry) not in existing_ids
+    ]
+    if not new_entries:
+        return 0
+
+    output_root = args.output_root.resolve()
+    next_index = len(state.get("tasks", [])) + 1
+    new_tasks = build_task_records(new_entries, output_root, start_index=next_index)
+    state.setdefault("tasks", []).extend(new_tasks)
+    update_state(state_path, state)
+    log(f"检测到 {len(new_tasks)} 个新任务，已追加到队列末尾。")
+    return len(new_tasks)
 
 
 def expand_command(dreamina: str, raw_command: str) -> list[str]:
@@ -765,6 +971,23 @@ def run_command(command: list[str]) -> CommandResult:
     )
 
 
+def compact_command(command: list[str], max_chars: int = 360) -> str:
+    text = " ".join(shlex.quote(part) for part in command)
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars].rstrip()}..."
+
+
+def command_failure_reason(result: CommandResult, stage: str) -> str:
+    output = result.combined.strip()
+    if output:
+        return output
+    return (
+        f"{stage} 执行失败：dreamina 返回码 {result.returncode}，但 stdout/stderr 为空。"
+        f"命令：{compact_command(result.command)}"
+    )
+
+
 def persist_command_logs(base_dir: Path, prefix: str, result: CommandResult) -> None:
     ensure_dir(base_dir)
     write_text(base_dir / f"{prefix}.stdout.log", result.stdout)
@@ -772,8 +995,66 @@ def persist_command_logs(base_dir: Path, prefix: str, result: CommandResult) -> 
 
 
 def update_state(state_path: Path, state: dict[str, Any]) -> None:
+    merge_external_state_before_save(state, state_path)
     state["updated_at"] = now_iso()
     save_state(state_path, state)
+    sync_project_queues_from_state(state)
+
+
+def patch_task_in_state(state_path: Path, task: dict[str, Any], updates: dict[str, Any]) -> None:
+    state = load_state(state_path)
+    tasks = state.get("tasks")
+    if not isinstance(tasks, list):
+        return
+
+    identity = task_identity(task)
+    signature = task_signature(task)
+    target = None
+    for candidate in tasks:
+        if not isinstance(candidate, dict):
+            continue
+        if identity[1] and task_identity(candidate) == identity:
+            target = candidate
+            break
+        if task_signature(candidate) == signature:
+            target = candidate
+            break
+    if target is None:
+        return
+
+    target.update(updates)
+    for key in [
+        "index",
+        "segment_id",
+        "segment_name",
+        "project_id",
+        "project_name",
+        "command",
+        "prompt",
+        "images",
+        "transition_prompts",
+        "videos",
+        "audios",
+        "duration",
+        "ratio",
+        "model_version",
+        "label",
+        "download_dir",
+    ]:
+        if key in task and key not in target:
+            target[key] = task.get(key)
+    state["updated_at"] = now_iso()
+    save_state(state_path, state)
+    sync_project_queue_task(target)
+
+
+def status_from_polled_result(parsed: dict[str, Any]) -> str:
+    gen_status = str(parsed.get("gen_status") or "").strip().lower()
+    if gen_status in SUCCESS_STATUSES:
+        return "success"
+    if gen_status in FAIL_STATUSES or parsed.get("fail_reason"):
+        return "failed"
+    return "running"
 
 
 def wait_for_completion(
@@ -784,6 +1065,7 @@ def wait_for_completion(
     timeout_seconds: int,
     task_log_dir: Path,
     log_prefix: str = "query",
+    on_status: Any | None = None,
 ) -> tuple[dict[str, Any], CommandResult]:
     started = time.time()
     last_result: CommandResult | None = None
@@ -801,9 +1083,11 @@ def wait_for_completion(
         last_result = result
         last_parsed = parsed
         status = parsed.get("gen_status")
+        if on_status:
+            on_status(parsed, result)
 
         if result.returncode != 0 and status not in TERMINAL_STATUSES:
-            raise RuntimeError(result.combined or "query_result 执行失败")
+            raise RuntimeError(command_failure_reason(result, "查询阶段"))
 
         if status in SUCCESS_STATUSES:
             ensure_dir(download_dir)
@@ -812,7 +1096,7 @@ def wait_for_completion(
             persist_command_logs(task_log_dir, f"{log_prefix}-final-download", final_result)
             final_parsed = parse_command_output(final_result.combined)
             if final_result.returncode != 0 and final_parsed.get("gen_status") not in SUCCESS_STATUSES:
-                raise RuntimeError(final_result.combined or "成功后下载结果失败")
+                raise RuntimeError(command_failure_reason(final_result, "成功后下载阶段"))
             merged = {**parsed, **final_parsed}
             urls = list(dict.fromkeys([*parsed.get("urls", []), *final_parsed.get("urls", [])]))
             merged["urls"] = urls
@@ -830,6 +1114,7 @@ def execute_task_attempt(
     task: dict[str, Any],
     task_log_dir: Path,
     command_text: str,
+    state_path: Path,
     submit_prefix: str = "submit",
     query_prefix: str = "query",
 ) -> dict[str, Any]:
@@ -839,12 +1124,13 @@ def execute_task_attempt(
     persist_command_logs(task_log_dir, submit_prefix, submit_result)
 
     parsed_submit = parse_command_output(submit_result.combined)
+    status = parsed_submit.get("gen_status")
     attempt: dict[str, Any] = {
         "command": command_text,
         "submit_stdout": str(task_log_dir / f"{submit_prefix}.stdout.log"),
         "submit_stderr": str(task_log_dir / f"{submit_prefix}.stderr.log"),
         "submit_id": parsed_submit.get("submit_id"),
-        "gen_status": parsed_submit.get("gen_status"),
+        "gen_status": status,
         "fail_reason": parsed_submit.get("fail_reason"),
         "urls": parsed_submit.get("urls", []),
         "final_stdout": None,
@@ -853,7 +1139,7 @@ def execute_task_attempt(
     }
 
     if submit_result.returncode != 0 and not attempt["submit_id"]:
-        attempt["fail_reason"] = attempt["fail_reason"] or submit_result.combined or f"exit code {submit_result.returncode}"
+        attempt["fail_reason"] = attempt["fail_reason"] or command_failure_reason(submit_result, "提交阶段")
         return attempt
 
     submit_id = attempt["submit_id"]
@@ -861,14 +1147,29 @@ def execute_task_attempt(
         attempt["fail_reason"] = "提交结果里没有解析到 submit_id，无法继续排队"
         return attempt
 
-    status = parsed_submit.get("gen_status")
+    patch_task_in_state(
+        state_path,
+        task,
+        {
+            "status": status_from_polled_result(parsed_submit),
+            "submit_id": submit_id,
+            "gen_status": status or "processing",
+            "fail_reason": None,
+            "submit_stdout": attempt["submit_stdout"],
+            "submit_stderr": attempt["submit_stderr"],
+            "started_at": task.get("started_at") or now_iso(),
+            "finished_at": None,
+            "download_dir": task.get("download_dir"),
+        },
+    )
+
     if status in SUCCESS_STATUSES:
         attempt["status"] = "success"
         return attempt
 
     if status in FAIL_STATUSES:
         if not attempt["fail_reason"]:
-            attempt["fail_reason"] = submit_result.combined or "提交阶段直接失败"
+            attempt["fail_reason"] = command_failure_reason(submit_result, "提交阶段")
         return attempt
 
     try:
@@ -880,6 +1181,17 @@ def execute_task_attempt(
             timeout_seconds=args.timeout_seconds,
             task_log_dir=task_log_dir,
             log_prefix=query_prefix,
+            on_status=lambda parsed, _result: patch_task_in_state(
+                state_path,
+                task,
+                {
+                    "status": status_from_polled_result(parsed),
+                    "submit_id": submit_id,
+                    "gen_status": parsed.get("gen_status") or "processing",
+                    "fail_reason": parsed.get("fail_reason"),
+                    "download_dir": task.get("download_dir"),
+                },
+            ),
         )
     except Exception as exc:
         attempt["fail_reason"] = str(exc)
@@ -890,12 +1202,69 @@ def execute_task_attempt(
     attempt["gen_status"] = final_parsed.get("gen_status")
     attempt["fail_reason"] = final_parsed.get("fail_reason")
     attempt["urls"] = final_parsed.get("urls", [])
-    if final_parsed.get("gen_status") in SUCCESS_STATUSES and final_result.returncode == 0:
+    if final_parsed.get("gen_status") in SUCCESS_STATUSES:
         attempt["status"] = "success"
         return attempt
 
-    attempt["fail_reason"] = attempt["fail_reason"] or final_result.combined or "query_result 未返回 success"
+    attempt["fail_reason"] = attempt["fail_reason"] or command_failure_reason(final_result, "下载/查询阶段")
     return attempt
+
+
+def continue_task_from_submit_id(
+    args: argparse.Namespace,
+    task: dict[str, Any],
+    task_log_dir: Path,
+    submit_id: str,
+    state_path: Path,
+) -> dict[str, Any]:
+    log(f"继续查询任务 #{task['index']}，submit_id={submit_id}")
+    try:
+        final_parsed, final_result = wait_for_completion(
+            dreamina=args.dreamina,
+            submit_id=submit_id,
+            download_dir=Path(task["download_dir"]),
+            poll_interval=args.poll_interval,
+            timeout_seconds=args.timeout_seconds,
+            task_log_dir=task_log_dir,
+            log_prefix="resume-query",
+            on_status=lambda parsed, _result: patch_task_in_state(
+                state_path,
+                task,
+                {
+                    "status": status_from_polled_result(parsed),
+                    "submit_id": submit_id,
+                    "gen_status": parsed.get("gen_status") or "processing",
+                    "fail_reason": parsed.get("fail_reason"),
+                    "download_dir": task.get("download_dir"),
+                },
+            ),
+        )
+    except Exception as exc:
+        return {
+            "command": str(task.get("command") or ""),
+            "submit_stdout": task.get("submit_stdout"),
+            "submit_stderr": task.get("submit_stderr"),
+            "submit_id": submit_id,
+            "gen_status": "failed",
+            "fail_reason": str(exc),
+            "urls": [],
+            "final_stdout": None,
+            "final_stderr": None,
+            "status": "failed",
+        }
+
+    return {
+        "command": str(task.get("command") or ""),
+        "submit_stdout": task.get("submit_stdout"),
+        "submit_stderr": task.get("submit_stderr"),
+        "submit_id": submit_id,
+        "gen_status": final_parsed.get("gen_status"),
+        "fail_reason": final_parsed.get("fail_reason"),
+        "urls": final_parsed.get("urls", []),
+        "final_stdout": str(task_log_dir / "resume-query-final-download.stdout.log"),
+        "final_stderr": str(task_log_dir / "resume-query-final-download.stderr.log"),
+        "status": "success" if final_parsed.get("gen_status") in SUCCESS_STATUSES else "failed",
+    }
 
 
 def apply_attempt_to_task(task: dict[str, Any], attempt: dict[str, Any], *, is_retry: bool = False) -> None:
@@ -932,12 +1301,53 @@ def run_queue(args: argparse.Namespace) -> int:
     state = prepare_state(args, entries)
     state_path = args.state_file.resolve()
 
-    for task in state["tasks"]:
+    if args.resume:
+        state["tasks"].sort(
+            key=lambda task: (
+                0 if str(task.get("status") or "") == "running" and str(task.get("submit_id") or "").strip() else 1,
+                int(task.get("index") or 0),
+            )
+        )
+        for index, task in enumerate(state["tasks"], start=1):
+            task["index"] = index
+        update_state(state_path, state)
+
+    task_index = 0
+    while task_index < len(state["tasks"]):
+        task = state["tasks"][task_index]
         if task["status"] == "success":
             log(f"跳过已完成任务 #{task['index']} submit_id={task.get('submit_id') or '-'}")
+            task_index += 1
+            append_new_tasks_from_queue(args, state, state_path)
             continue
-        if task["status"] == "running" and args.resume:
-            task["status"] = "pending"
+        if str(task.get("status") or "").lower() in TERMINAL_STATUSES:
+            log(f"跳过终态任务 #{task['index']} status={task.get('status') or '-'} submit_id={task.get('submit_id') or '-'}")
+            task_index += 1
+            append_new_tasks_from_queue(args, state, state_path)
+            continue
+        if task["status"] == "running":
+            submit_id = str(task.get("submit_id") or "").strip()
+            if submit_id:
+                label = task["label"]
+                task_log_dir = output_root / "logs" / label
+                ensure_dir(task_log_dir)
+                attempt = continue_task_from_submit_id(args, task, task_log_dir, submit_id, state_path)
+                apply_attempt_to_task(task, attempt)
+                task["finished_at"] = now_iso()
+                update_state(state_path, state)
+                if task["status"] == "success":
+                    log(f"任务 #{task['index']} 续跑完成，submit_id={submit_id}，已下载到 {task['download_dir']}")
+                    task_index += 1
+                    append_new_tasks_from_queue(args, state, state_path)
+                    continue
+                log(f"任务 #{task['index']} 续跑失败，submit_id={submit_id}，原因: {task.get('fail_reason') or '-'}")
+                if args.stop_on_failure:
+                    return 1
+                task_index += 1
+                append_new_tasks_from_queue(args, state, state_path)
+                continue
+            if args.resume:
+                task["status"] = "pending"
 
         label = task["label"]
         task_log_dir = output_root / "logs" / label
@@ -948,12 +1358,26 @@ def run_queue(args: argparse.Namespace) -> int:
         task["gen_status"] = "processing"
         task["finished_at"] = None
         update_state(state_path, state)
-        first_attempt = execute_task_attempt(args, task, task_log_dir, task["command"])
+        patch_task_in_state(
+            state_path,
+            task,
+            {
+                "status": "running",
+                "submit_id": task.get("submit_id"),
+                "gen_status": "processing",
+                "fail_reason": None,
+                "started_at": task["started_at"],
+                "finished_at": None,
+                "download_dir": task.get("download_dir"),
+            },
+        )
+        first_attempt = execute_task_attempt(args, task, task_log_dir, task["command"], state_path)
         apply_attempt_to_task(task, first_attempt)
 
         final_attempt = first_attempt
         task["status"] = final_attempt["status"]
         task["finished_at"] = now_iso()
+        merge_external_state_tasks(state, state_path)
         update_state(state_path, state)
 
         if final_attempt["status"] == "success":
@@ -963,11 +1387,15 @@ def run_queue(args: argparse.Namespace) -> int:
                 )
             else:
                 log(f"任务 #{task['index']} 完成，submit_id={task.get('submit_id') or '-'}，已下载到 {task['download_dir']}")
+            task_index += 1
+            append_new_tasks_from_queue(args, state, state_path)
             continue
 
         log(f"任务 #{task['index']} 失败，submit_id={task.get('submit_id') or '-'}，原因: {task.get('fail_reason') or '-'}")
         if args.stop_on_failure:
             return 1
+        task_index += 1
+        append_new_tasks_from_queue(args, state, state_path)
         continue
 
     failures = [task for task in state["tasks"] if task["status"] == "failed"]
@@ -1000,7 +1428,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--state-file",
         type=Path,
-        default=Path("./queue-output/queue-state.json"),
+        default=APP_DIR / "queue-state.json",
         help="状态文件路径，用于断点续跑。",
     )
     parser.add_argument(

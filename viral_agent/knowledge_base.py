@@ -48,9 +48,17 @@ def add_script(
     doc_metadata = {
         "video_id": video_id,
         "likes": metadata.get("likes", 0),
+        "engagement_level": metadata.get("engagement_level", analysis.get("engagement_level", "")),
         "niche": metadata.get("niche", ""),
+        "channel": metadata.get("channel", ""),
+        "source_account": metadata.get("source_account", metadata.get("author", "")),
         "hook_type": analysis.get("hook_type", ""),
         "hook": analysis.get("hook", ""),
+        "topic_type": analysis.get("topic_type", ""),
+        "topic_formula": analysis.get("topic_formula", ""),
+        "style_tags": ",".join(analysis.get("style_tags", [])) if isinstance(analysis.get("style_tags"), list) else str(analysis.get("style_tags", "")),
+        "quality_score": int(analysis.get("quality_score", 0) or 0),
+        "replication_score": int(analysis.get("replication_score", 0) or 0),
         "structure": analysis.get("structure", ""),
         "why_viral": analysis.get("why_viral", ""),
         "analysis_json": json.dumps(analysis, ensure_ascii=False),
@@ -75,6 +83,18 @@ def has_script(video_id: str) -> bool:
     return bool(result.get("ids"))
 
 
+def delete_script(video_id: str) -> bool:
+    """从知识库删除指定 video_id。返回删除前是否存在。"""
+    if not video_id:
+        return False
+    collection = get_db()
+    existed = has_script(video_id)
+    if existed:
+        collection.delete(ids=[video_id])
+        print(f"🗑️ 已从知识库删除: {video_id}")
+    return existed
+
+
 def search_scripts(query: str, n: int = 5, niche: Optional[str] = None) -> list[dict]:
     """语义检索相似爆款文案"""
     collection = get_db()
@@ -95,9 +115,16 @@ def search_scripts(query: str, n: int = 5, niche: Optional[str] = None) -> list[
                 "script": meta.get("script", ""),
                 "hook": meta.get("hook", ""),
                 "hook_type": meta.get("hook_type", ""),
+                "topic_type": meta.get("topic_type", ""),
+                "topic_formula": meta.get("topic_formula", ""),
+                "source_account": meta.get("source_account", ""),
+                "channel": meta.get("channel", ""),
                 "structure": meta.get("structure", ""),
                 "why_viral": meta.get("why_viral", ""),
                 "likes": meta.get("likes", 0),
+                "engagement_level": meta.get("engagement_level", ""),
+                "quality_score": meta.get("quality_score", 0),
+                "replication_score": meta.get("replication_score", 0),
                 "analysis": json.loads(meta.get("analysis_json", "{}")),
                 "metadata": meta,
                 "similarity": 1 - results["distances"][0][i],

@@ -11,10 +11,12 @@ import math
 import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 
 from scripts.claude_client import ClaudeClient
 
 
+# 默认画风模板（向后兼容）
 FIXED_STYLE_TEMPLATE = (
     "温馨治愈日系二维手绘动画画风，吉卜力式温暖动画质感，宫崎骏动画电影般的柔和氛围，"
     "非真实摄影，非写实视频，非3D，非半写实；画面为纯二维手绘动画质感，线条柔和流畅，"
@@ -27,20 +29,136 @@ FIXED_STYLE_TEMPLATE = (
     "都要画成柔和、干净、温暖、易懂的动画化示意，不要冷冰冰科技风，不要真实医学图，不要恐怖微观画面。"
 )
 
-QUALITY_REQUIREMENTS = (
-    "适配即梦 Seedance 2.0，全能参考入口文生视频模式，16:9 横屏，物理规律合理，动作表现自然流畅，"
-    "镜头衔接连贯顺滑，指令理解精准，画面风格全程稳定统一，角色造型细节全程一致无跳变，"
-    "猫狗动作自然不僵硬，猫狗微表情生动，情绪演绎精准到位，科普示意画面清晰易懂，"
-    "故事画面与科普插帧自然衔接，光影质感自然，画面细节清晰丰富，无画面崩坏，无逻辑错误，"
-    "无角色变形，无画风漂移。"
+
+def _load_channel_styles() -> dict:
+    """加载频道画风配置"""
+    config_path = Path(__file__).parent.parent / ".webui" / "channel_styles.json"
+    if not config_path.exists():
+        return {"version": 1, "channels": [], "default_channel": None}
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {"version": 1, "channels": [], "default_channel": None}
+
+
+def get_channel_choices() -> list[tuple[str, str]]:
+    """获取频道选择列表，返回 (显示名称, channel_id)"""
+    config = _load_channel_styles()
+    channels = config.get("channels", [])
+    choices = []
+    for channel in channels:
+        if not isinstance(channel, dict):
+            continue
+        if not channel.get("enabled", True):
+            continue
+        channel_id = str(channel.get("id", ""))
+        name = str(channel.get("name", channel_id))
+        if channel_id:
+            choices.append((name, channel_id))
+    return choices
+
+
+def get_default_channel_id() -> str | None:
+    """获取默认频道ID"""
+    config = _load_channel_styles()
+    return config.get("default_channel")
+
+GLOBAL_QUALITY_REQUIREMENTS = (
+    "适配即梦 Seedance 2.0，全能参考入口文生视频模式，16:9 横屏，指令理解精准，"
+    "画面风格全程稳定统一，角色造型细节全程一致无跳变，科普示意画面清晰易懂，"
+    "无画面崩坏，无逻辑错误，无角色变形，无画风漂移。"
 )
 
-NEGATIVE_CONSTRAINTS = (
-    "屏幕上不要出现任何字幕、中文文字、英文文字、水印、logo、账号名、标题贴纸。"
-    "不要生成旁白、配音、人声朗读，不要生成突兀音乐，优先保留自然温柔的环境音效。"
-    "禁止真实摄影、写实真人脸部、3D建模感、半写实人物、欧美美漫风、低幼Q版夸张卡通，"
-    "禁止画面过暗，整体亮度中等偏亮，保持温暖、清晰、干净。"
+NO_DIALOGUE_CONSTRAINTS = (
+    "画面内容按纯视觉设计，全程不要人声朗读、不要人物聊天声、不要口型讲话、不要宠物拟人说话；"
+    "人物和猫狗通过表情、动作和画面氛围表达情绪，嘴巴保持自然闭合或呼吸状态。"
 )
+
+GLOBAL_NEGATIVE_CONSTRAINTS = (
+    "屏幕上不要出现任何字幕、中文文字、英文文字、水印、logo、账号名、标题贴纸。"
+    "不要真实摄影、不要写实真人脸部、不要3D建模感、不要水印、不要低清晰度画面。"
+)
+
+
+CHANNEL_PROMPT_PROFILES = {
+    "channel-healing": {
+        "split_style": "温馨治愈日系二维手绘动画，猫狗行为故事主线 + 科普示意插帧 + 情绪隐喻镜头",
+        "motion": (
+            "本频道按剧情式二维手绘动画处理，动作自然流畅，镜头衔接顺滑，猫狗微表情生动，"
+            "主人和宠物有清晰但不过度夸张的互动，整体亮度中等偏亮，保持温暖、清晰、干净。"
+        ),
+        "shot_guidance": "每段平均约2秒一个分镜。15秒通常7-8个分镜，10秒通常5个分镜，5秒通常2-3个分镜。",
+        "science_guidance": "科普词出现时必须有动画化科普示意，不能只拍猫狗坐着或发呆。",
+        "shot_counts": (3, 5, 8),
+        "shot_styles": [
+            "近景固定镜头",
+            "微距特写镜头，缓慢推近",
+            "科普示意镜头，柔和转场",
+            "中景轻微横移",
+            "俯拍镜头，缓慢下移",
+            "主观视角镜头，轻微跟拍",
+            "特写镜头，柔和拉近",
+            "全景镜头，慢慢拉远",
+        ],
+    },
+    "channel-science": {
+        "split_style": "明亮透明水彩绘本插画轻动态，猫狗日常生活切片 + 纸面手绘科普小图示",
+        "motion": (
+            "本频道不是剧情动画片段，而是透明水彩插画轻动态；动作幅度小，画面像手绘插画缓慢呼吸，"
+            "以慢速横移、轻微推近、细微视差、前景玻璃花瓶或书本柔焦遮挡为主，避免频繁切镜和强剧情动画表演。"
+        ),
+        "shot_guidance": "每段不要频繁切镜。15秒通常3-5个画面重点，10秒通常3个画面重点，5秒通常2个画面重点。",
+        "science_guidance": "科普内容用浅色半透明手绘图示表现，像画在纸上的水彩小插图，不要发光特效和科技感。",
+        "shot_counts": (2, 3, 5),
+        "shot_styles": [
+            "窗边中景慢速横移",
+            "前景玻璃花瓶柔焦遮挡，细微视差",
+            "纸面手绘科普小图示，轻轻浮现",
+            "桌面近景轻微推近",
+            "固定镜头，角色和花叶只有细小动作",
+        ],
+    },
+    "channel-funny": {
+        "split_style": "日系二次元AI厚涂动态插画，冷淡厌世女仆系角色气质 + 宠物反差萌表现 + 科普装饰图示",
+        "motion": (
+            "本频道按二次元AI厚涂动态插画处理，整体有柔雾感、厚涂渐变和轻微低清短视频质感；"
+            "动态只作为插画轻度动态化，主要通过半闭眼眨动、轻微表情变化、头部细动、衣发轻摆、宠物姿态变化和镜头轻微推进完成，"
+            "不固定具体场景和动作，不依赖复杂逐帧动画，避免高清动漫电影截图感和过度温柔治愈感。"
+        ),
+        "shot_guidance": "每段使用角色向轻动态画面。15秒通常4-6个画面重点，10秒通常4个画面重点，5秒通常2个画面重点。",
+        "science_guidance": "科普示意保持二次元厚涂装饰图示风格，可爱、清晰、易懂，不要真实医学图，不要科技感过重。",
+        "shot_counts": (2, 4, 6),
+        "shot_styles": [
+            "角色向镜头轻微推近",
+            "宠物反差萌特写，轻微眨眼或转头",
+            "二次元厚涂科普装饰图示，轻轻浮现",
+            "中景固定镜头，衣发和宠物只有细小动作",
+            "冷淡无语表情反应特写，轻微拉近",
+            "按内容自然选择的场景轻微横移",
+        ],
+    },
+}
+
+
+DEFAULT_PROMPT_PROFILE = {
+    "split_style": "猫狗治愈动画，行为故事主线 + 科普示意插帧 + 情绪隐喻镜头",
+    "motion": "动作自然，镜头衔接顺滑，猫狗表情生动，整体保持温暖、清晰、干净。",
+    "shot_guidance": "每段按内容信息密度安排分镜。15秒通常5-7个分镜，10秒通常4个分镜，5秒通常2个分镜。",
+    "science_guidance": "科普词出现时安排清晰、柔和、易懂的科普示意。",
+    "shot_counts": (2, 4, 7),
+    "shot_styles": [
+        "近景固定镜头",
+        "微距特写镜头，缓慢推近",
+        "科普示意镜头，柔和转场",
+        "中景轻微横移",
+        "全景镜头，慢慢拉远",
+    ],
+}
+
+
+def _channel_profile(channel_id: str | None = None) -> dict:
+    return CHANNEL_PROMPT_PROFILES.get(str(channel_id or ""), DEFAULT_PROMPT_PROFILE)
 
 
 BEHAVIOR_KEYWORDS = {
@@ -52,11 +170,11 @@ BEHAVIOR_KEYWORDS = {
     "靠": "{pet_label}把身体贴近主人腿边，缓慢蹭蹭",
     "蹭": "{pet_label}用脸颊或身体轻轻蹭主人，动作亲密自然",
     "踩奶": "猫咪在柔软毯子上轻轻踩奶，爪子一伸一缩",
-    "呼噜": "猫咪眯着眼发出轻柔呼噜，身体完全放松",
+    "呼噜": "猫咪眯着眼趴在毯子上，喉部轻微起伏，身体完全放松",
     "看": "{pet_label}抬头看向主人，眼睛明亮，轻轻眨眼",
-    "叫": "{pet_label}轻声回应主人，表情柔软",
-    "喵": "猫咪轻轻喵叫回应，耳朵微动，眼神柔软",
-    "汪": "狗狗轻声汪叫回应，尾巴轻摆，表情柔软",
+    "叫": "{pet_label}抬头看向主人，耳朵微动，表情柔软，用动作安静回应",
+    "喵": "猫咪抬头看向主人，耳朵微动，眼神柔软，用动作安静回应",
+    "汪": "狗狗抬头看向主人，尾巴轻摆，表情柔软，用动作安静回应",
     "趴": "{pet_label}趴在温暖地板或沙发边，身体完全放松",
 }
 
@@ -112,7 +230,7 @@ def detect_pet_context(text: str) -> dict[str, str]:
         return {
             "kind": "cat",
             "pet_label": "猫咪",
-            "subject_style": "可爱的猫咪或逐字稿指定猫咪，胡须细腻、耳朵灵动、尾巴动作自然",
+            "subject_style": "可爱的猫咪或本次内容指定猫咪，胡须细腻、耳朵灵动、尾巴动作自然",
             "love_phrase": "像在重新理解猫咪的爱",
             "strategy_label": "猫咪行为主线",
         }
@@ -120,14 +238,14 @@ def detect_pet_context(text: str) -> dict[str, str]:
         return {
             "kind": "dog",
             "pet_label": "狗狗",
-            "subject_style": "可爱的金毛犬或逐字稿指定狗狗，耳朵灵动、尾巴动作自然",
+            "subject_style": "可爱的金毛犬或本次内容指定狗狗，耳朵灵动、尾巴动作自然",
             "love_phrase": "像在重新理解狗狗的爱",
             "strategy_label": "狗狗行为主线",
         }
     return {
         "kind": "pet",
         "pet_label": "猫咪或狗狗",
-        "subject_style": "可爱的猫咪或狗狗，优先遵循逐字稿指定宠物，耳朵灵动、动作自然",
+        "subject_style": "可爱的猫咪或狗狗，优先遵循本次内容指定宠物，耳朵灵动、动作自然",
         "love_phrase": "像在重新理解毛孩子的爱",
         "strategy_label": "猫狗行为主线",
     }
@@ -137,8 +255,27 @@ def _render_template(text: str, pet_context: dict[str, str]) -> str:
     return text.format(**pet_context)
 
 
-def fixed_style_for_pet(pet_context: dict[str, str]) -> str:
-    return _render_template(FIXED_STYLE_TEMPLATE, pet_context)
+def get_style_template_for_channel(channel_id: str | None = None) -> str:
+    """根据频道ID获取画风模板"""
+    if not channel_id:
+        return FIXED_STYLE_TEMPLATE
+
+    config = _load_channel_styles()
+    channels = config.get("channels", [])
+
+    for channel in channels:
+        if not isinstance(channel, dict):
+            continue
+        if str(channel.get("id", "")) == str(channel_id):
+            return str(channel.get("style_template", FIXED_STYLE_TEMPLATE))
+
+    return FIXED_STYLE_TEMPLATE
+
+
+def fixed_style_for_pet(pet_context: dict[str, str], channel_id: str | None = None) -> str:
+    """获取渲染后的画风模板（支持频道选择）"""
+    template = get_style_template_for_channel(channel_id)
+    return _render_template(template, pet_context)
 
 
 def _normalize_text(text: str) -> str:
@@ -156,7 +293,22 @@ def _json_from_model_text(text: str) -> dict:
     end = clean.rfind("}")
     if start >= 0 and end > start:
         clean = clean[start:end + 1]
-    return json.loads(clean)
+    try:
+        return json.loads(clean)
+    except json.JSONDecodeError as e:
+        # 尝试修复常见的 JSON 错误
+        # 1. 移除尾随逗号
+        fixed = re.sub(r',(\s*[}\]])', r'\1', clean)
+        try:
+            return json.loads(fixed)
+        except json.JSONDecodeError:
+            # 如果还是失败，打印更详细的错误信息
+            lines = clean.split('\n')
+            error_line = e.lineno if hasattr(e, 'lineno') else 0
+            context_start = max(0, error_line - 3)
+            context_end = min(len(lines), error_line + 3)
+            context = '\n'.join(f"{i+1:3d}: {lines[i]}" for i in range(context_start, context_end))
+            raise ValueError(f"JSON 解析失败在第 {e.lineno} 行: {e.msg}\n上下文:\n{context}") from e
 
 
 def _call_ai_splitter(prompt: str) -> dict:
@@ -224,8 +376,16 @@ def analyze_keywords(text: str, pet_context: dict[str, str] | None = None) -> di
     }
 
 
-def _segment_function(index: int, total: int, keywords: dict[str, list[str]], pet_context: dict[str, str]) -> str:
+def _segment_function(index: int, total: int, keywords: dict[str, list[str]], pet_context: dict[str, str], channel_id: str | None = None) -> str:
     pet_label = pet_context["pet_label"]
+    if channel_id == "channel-science":
+        if index == 1:
+            return f"开头生活切片，用明亮水彩插画建立{pet_label}与主人的安静陪伴"
+        if index == total:
+            return f"情绪收束，用透明水彩轻动态呈现主人和{pet_label}的温柔陪伴"
+        if keywords["science"]:
+            return "轻科普解释段，用纸面手绘水彩图示解释行为背后的原因"
+        return f"日常画面推进段，用{pet_label}的小动作和室内光线承接情绪"
     if index == 1:
         return f"开头强钩子，建立{pet_label}行为误会与治愈期待"
     if index == total:
@@ -235,14 +395,16 @@ def _segment_function(index: int, total: int, keywords: dict[str, list[str]], pe
     return f"故事推进段，用{pet_label}行为和主人反应承接情绪共鸣"
 
 
-def _scene_for_segment(text: str) -> str:
+def _scene_for_segment(text: str, channel_id: str | None = None) -> str:
     if any(word in text for word in ["睡", "床", "卧室"]):
-        return "暖黄色卧室和床边地毯"
+        return "按本段内容自然选择的卧室或睡眠相关生活场景"
     if any(word in text for word in ["草地", "公园", "狼", "远古"]):
-        return "阳光草地或温柔远古营地"
-    if any(word in text for word in ["沙发", "客厅", "家里", "主人"]):
-        return "温暖客厅、沙发边和家庭地板"
-    return "温暖客厅与窗边阳光区域"
+        return "按本段内容自然选择的户外草地、公园或远古生活场景"
+    if any(word in text for word in ["窗", "书桌", "纸", "铅笔", "咖啡", "茶", "书架"]):
+        return "按本段内容自然选择的窗边、书桌或文艺日常场景"
+    if any(word in text for word in ["沙发", "客厅", "家里", "主人", "陪伴"]):
+        return "按本段内容自然选择的家庭日常生活场景"
+    return "按本段内容自然选择的生活化场景"
 
 
 def _main_action(text: str, keywords: dict[str, list[str]], pet_context: dict[str, str]) -> str:
@@ -262,32 +424,40 @@ def _main_emotion(text: str, keywords: dict[str, list[str]], pet_context: dict[s
     return f"温馨、治愈、轻科普、被{pet_context['pet_label']}爱着的安心感"
 
 
-def _shot_count(duration: int) -> int:
+def _shot_count(duration: int, channel_id: str | None = None) -> int:
+    short_count, medium_count, long_count = _channel_profile(channel_id)["shot_counts"]
     if duration <= 5:
-        return 3
+        return short_count
     if duration <= 10:
-        return 5
-    return 8
+        return medium_count
+    return long_count
 
 
-def _shot_visuals(text: str, keywords: dict[str, list[str]], pet_context: dict[str, str]) -> list[str]:
+def _shot_visuals(text: str, keywords: dict[str, list[str]], pet_context: dict[str, str], channel_id: str | None = None) -> list[str]:
     visuals = []
     visuals.extend(keywords["behaviors"])
     visuals.extend(keywords["science"])
     visuals.extend(keywords["emotions"])
     if not visuals:
         pet_label = pet_context["pet_label"]
-        visuals = [
-            f"{pet_label}抬头看向主人，眼睛明亮，轻轻眨眼",
-            f"主人蹲下伸手轻摸{pet_label}头顶，表情逐渐放松",
-            f"暖黄色光点在主人和{pet_label}之间缓慢扩散，空气变得柔软",
-        ]
+        if channel_id == "channel-science":
+            visuals = [
+                f"{pet_label}安静趴在窗边书桌旁，轻轻眨眼或微微转头",
+                f"主人在纸张旁停下笔，手部动作很轻，阳光落在桌面和{pet_label}身上",
+                "玻璃花瓶、书本和纸张形成柔和前景遮挡，画面保持清透留白",
+            ]
+        else:
+            visuals = [
+                f"{pet_label}抬头看向主人，眼睛明亮，轻轻眨眼",
+                f"主人蹲下伸手轻摸{pet_label}头顶，表情逐渐放松",
+                f"暖黄色光点在主人和{pet_label}之间缓慢扩散，空气变得柔软",
+            ]
     return visuals
 
 
-def build_storyboard(duration: int, text: str, keywords: dict[str, list[str]], pet_context: dict[str, str]) -> list[str]:
-    count = _shot_count(duration)
-    visuals = _shot_visuals(text, keywords, pet_context)
+def build_storyboard(duration: int, text: str, keywords: dict[str, list[str]], pet_context: dict[str, str], channel_id: str | None = None) -> list[str]:
+    count = _shot_count(duration, channel_id)
+    visuals = _shot_visuals(text, keywords, pet_context, channel_id)
     shots = []
     ranges = []
     start = 0
@@ -298,23 +468,19 @@ def build_storyboard(duration: int, text: str, keywords: dict[str, list[str]], p
         if start >= duration:
             break
 
-    shot_styles = [
-        "近景固定镜头",
-        "微距特写镜头，缓慢推近",
-        "科普示意镜头，柔和转场",
-        "中景轻微横移",
-        "俯拍镜头，缓慢下移",
-        "主观视角镜头，轻微跟拍",
-        "特写镜头，柔和拉近",
-        "全景镜头，慢慢拉远",
-    ]
+    shot_styles = _channel_profile(channel_id)["shot_styles"]
     for idx, (start, end) in enumerate(ranges):
         visual = visuals[idx % len(visuals)]
-        if idx == 0 and "误会" not in visual:
+        if channel_id == "channel-science" and idx == 0:
+            visual = f"窗边强烈但柔和的日光照亮桌面，{visual}"
+        elif idx == 0 and "误会" not in visual:
             visual = f"主人先露出轻微疑惑，随后看见{visual}"
         if idx == len(ranges) - 1:
-            visual = f"{visual}，画面收束在主人与{pet_context['pet_label']}安静陪伴的温暖瞬间"
-        shots.append(f"{start}-{end}秒：{shot_styles[idx % len(shot_styles)]}，{visual}，对应逐字稿画面关键词“{_keyword_excerpt(text)}”。")
+            if channel_id == "channel-science":
+                visual = f"{visual}，画面像水彩插画一样缓慢呼吸，收束在主人与{pet_context['pet_label']}安静陪伴的明亮瞬间"
+            else:
+                visual = f"{visual}，画面收束在主人与{pet_context['pet_label']}安静陪伴的温暖瞬间"
+        shots.append(f"{start}-{end}秒：{shot_styles[idx % len(shot_styles)]}，{visual}。")
     return shots
 
 
@@ -336,6 +502,57 @@ def _ensure_sentence_end(text: str) -> str:
     return clean if re.search(r"[。！？!?；;.]$", clean) else clean + "。"
 
 
+def _sanitize_storyboard_items(items: list[object]) -> list[str]:
+    clean_items = []
+    for item in items:
+        clean = _sanitize_visual_text(str(item))
+        if clean:
+            clean_items.append(_ensure_sentence_end(clean))
+    return clean_items
+
+
+def _sanitize_visual_text(text: str) -> str:
+    clean = str(text or "").strip()
+    replacements = [
+        (r"[，,。；;]?\s*对应逐字稿画面关键词“[^”]*”", ""),
+        (r"[，,。；;]?\s*对应逐字稿关键词“[^”]*”", ""),
+        (r"[，,。；;]?\s*对应解说关键词“[^”]*”", ""),
+        (r"[，,。；;]?\s*对应旁白“[^”]*”", ""),
+        (r"[，,。；;]?\s*对应台词“[^”]*”", ""),
+        (r"[，,。；;]?\s*对应口播“[^”]*”", ""),
+        (r"[，,。；;]?\s*对应[^。；;]*", ""),
+        (r"[，,。；;]?\s*视觉重点[：:][^。；;]*", ""),
+        (r"[，,。；;]?\s*视觉重点“[^”]*”", ""),
+        (r"[，,。；;]?\s*画面重点[：:][^。；;]*", ""),
+        (r"[，,。；;]?\s*画面重点“[^”]*”", ""),
+        (r"旁白[:：][^。；;]*", ""),
+        (r"解说[:：][^。；;]*", ""),
+        (r"台词[:：][^。；;]*", ""),
+        (r"口播[:：][^。；;]*", ""),
+        (r"旁白内容[:：][^。；;]*", ""),
+        (r"解说内容[:：][^。；;]*", ""),
+        (r"台词内容[:：][^。；;]*", ""),
+        (r"口播内容[:：][^。；;]*", ""),
+        (r"字幕[^，。；;]*", ""),
+        (r"说出[^，。；;]*", "用表情和动作表达"),
+        (r"开口说话", "保持安静表情"),
+        (r"张嘴说话", "保持自然表情"),
+        (r"人物对话", "人物无声互动"),
+        (r"人物说话", "人物无声互动"),
+        (r"狗狗说话|猫咪说话|动物说话", "宠物通过动作表达"),
+        (r"狗狗开口|猫咪开口|动物开口", "宠物通过动作表达"),
+        (r"配音|对白|台词|口播|朗读", "视觉表达"),
+    ]
+    for pattern, repl in replacements:
+        clean = re.sub(pattern, repl, clean)
+    clean = clean.replace("逐字稿", "画面").replace("解说", "画面").replace("旁白", "画面")
+    clean = clean.replace("台词", "画面").replace("口播", "画面").replace("对白", "画面")
+    clean = re.sub(r"[，,]\s*[。；;]", "。", clean)
+    clean = re.sub(r"：\s*[。；;]", "。", clean)
+    clean = re.sub(r"\s+", " ", clean).strip()
+    return clean
+
+
 def _material_instruction(material_refs: dict[str, str] | None) -> str:
     if not material_refs:
         return ""
@@ -350,37 +567,49 @@ def _material_instruction(material_refs: dict[str, str] | None) -> str:
     return "参考素材用途：" + "；".join(lines) + "。"
 
 
+def _join_visual_state(*parts: str) -> str:
+    clean_parts = [_sanitize_visual_text(part).strip("，,。；; ") for part in parts if _sanitize_visual_text(part).strip("，,。；; ")]
+    return "，".join(clean_parts) if clean_parts else "猫狗自然活动，主人安静陪伴"
+
+
 def build_prompt_for_segment(
     segment: SeedanceSegment,
     pet_context: dict[str, str],
     material_refs: dict[str, str] | None = None,
+    channel_id: str | None = None,
 ) -> str:
     material_text = _material_instruction(material_refs)
-    storyboard_text = " ".join(_ensure_sentence_end(item) for item in segment.storyboard if str(item).strip())
+    storyboard_text = " ".join(_ensure_sentence_end(_sanitize_visual_text(item)) for item in segment.storyboard if str(item).strip())
+    profile = _channel_profile(channel_id)
     return (
-        f"{fixed_style_for_pet(pet_context)} 16:9 横屏。{material_text}"
-        f"本段主场景：{segment.scene}。本段{pet_context['pet_label']}和主人状态：{segment.main_action}，{segment.emotion}。"
+        f"{NO_DIALOGUE_CONSTRAINTS}{fixed_style_for_pet(pet_context, channel_id)} 16:9 横屏。{material_text}"
+        f"本段主场景：{_sanitize_visual_text(segment.scene)}。"
+        f"本段{pet_context['pet_label']}和主人状态：{_join_visual_state(segment.main_action, segment.emotion)}。"
         f"本段按时间轴分镜：{storyboard_text} "
         f"主情绪氛围：温馨治愈、轻科普、{pet_context['love_phrase']}。"
-        f"{QUALITY_REQUIREMENTS}{NEGATIVE_CONSTRAINTS}"
+        f"{profile['motion']}{GLOBAL_QUALITY_REQUIREMENTS}{GLOBAL_NEGATIVE_CONSTRAINTS}"
     )
 
 
-def _ai_split_prompt(transcript: str, pet_context: dict[str, str]) -> str:
-    return f"""你是抖音猫狗治愈动画轻科普账号的分镜导演。请把逐字稿拆成适配即梦 Seedance 2.0 的文生视频任务段，并输出严格 JSON。
+def _ai_split_prompt(transcript: str, pet_context: dict[str, str], channel_id: str | None = None) -> str:
+    profile = _channel_profile(channel_id)
+    return f"""你是抖音猫狗治愈轻科普账号的纯视觉导演。请把输入文案拆成适配即梦 Seedance 2.0 的文生视频任务段，并输出严格 JSON。
 
 主体识别：{pet_context['pet_label']}
-目标风格：温馨治愈日系二维手绘动画，猫狗行为故事主线 + 科普示意插帧 + 情绪隐喻镜头。
+目标风格：{profile['split_style']}。
+动态原则：{profile['motion']}
 
 硬性规则：
 1. 每段 duration 必须是 4-15 的整数，优先 15 秒，最后一段可以 4-14 秒，不要为了凑满 15 秒加无效画面。
-2. 每段平均约 2 秒一个分镜。15 秒通常 7-8 个分镜，10 秒通常 5 个分镜，5 秒通常 2-3 个分镜。
-3. 每个分镜必须写清时间轴、景别、运镜、画面动作、对应逐字稿画面关键词，但不要要求画面生成旁白或字幕。
-4. 必须主动识别逐字稿里的猫狗行为关键词、情绪关键词、轻科普关键词，并安排对应画面。
-5. 科普词出现时必须有动画化科普示意，不能只拍猫狗坐着或发呆。
-6. 主人不能抢戏，猫狗永远是核心主体；人物只能是柔和二维动画人物，避免写实真人脸部。
+2. {profile['shot_guidance']}
+3. 每个分镜必须写清时间轴、景别、运镜、画面动作，分镜描述以可看见的画面为主；可以保留自然动作音效和环境音效，但不要设计人声内容。
+4. 必须主动识别输入文案里的猫狗行为关键词、情绪关键词、轻科普关键词，并安排对应画面。
+5. {profile['science_guidance']}
+6. 主人不能抢戏，猫狗永远是核心主体；人物只能以当前频道画风表现，避免写实真人脸部。
 7. 不要输出固定画风、负面约束和质量词，这些由程序统一注入。
-8. 只输出 JSON，不要 Markdown，不要解释。
+8. 严禁在 function、main_action、emotion、scene、storyboard 中出现或暗示：字幕、文字贴片、人物开口、宠物开口、人声朗读、聊天、对白、台词、口播、配音、旁白、解说；允许出现脚步声、爪子踩地声、球落地声、布料摩擦声、轻微呼吸声、猫咪自然呼噜声、风声、草地声和室内环境声。
+9. 严禁在 storyboard 中写“对应……”“视觉重点……”“画面重点……”或复制输入文案原句；分镜只能写镜头中实际发生的可见动作和动画化示意。
+10. 只输出 JSON，不要 Markdown，不要解释。
 
 JSON 格式：
 {{
@@ -393,14 +622,14 @@ JSON 格式：
       "emotion": "本段核心情绪",
       "scene": "本段核心场景",
       "storyboard": [
-        "0-2秒：近景固定镜头，画面动作，对应逐字稿画面关键词“...”",
-        "2-4秒：微距特写镜头，画面动作，对应逐字稿画面关键词“...”"
+        "0-2秒：近景固定镜头，猫咪或狗狗在温暖室内自然抬头，主人手部轻轻停在旁边，画面安静柔和",
+        "2-4秒：微距特写镜头，镜头缓慢推近猫咪或狗狗的毛发，柔和的科普示意元素轻轻出现"
       ]
     }}
   ]
 }}
 
-逐字稿：
+输入文案：
 {transcript}
 """
 
@@ -413,7 +642,7 @@ def _coerce_duration(value: object) -> int:
     return max(4, min(15, duration))
 
 
-def _segments_from_ai_plan(plan: dict, transcript: str, pet_context: dict[str, str], material_refs: dict[str, str] | None) -> list[SeedanceSegment]:
+def _segments_from_ai_plan(plan: dict, transcript: str, pet_context: dict[str, str], material_refs: dict[str, str] | None, channel_id: str | None = None) -> list[SeedanceSegment]:
     raw_segments = plan.get("segments")
     if not isinstance(raw_segments, list) or not raw_segments:
         raise ValueError("AI拆分结果缺少 segments")
@@ -429,49 +658,49 @@ def _segments_from_ai_plan(plan: dict, transcript: str, pet_context: dict[str, s
         storyboard = raw.get("storyboard")
         if not isinstance(storyboard, list):
             storyboard = []
-        storyboard = [_ensure_sentence_end(item) for item in storyboard if str(item).strip()]
+        storyboard = _sanitize_storyboard_items(storyboard)
         if not storyboard:
             keywords = analyze_keywords(text, pet_context)
-            storyboard = build_storyboard(duration, text, keywords, pet_context)
+            storyboard = build_storyboard(duration, text, keywords, pet_context, channel_id)
 
         keywords = analyze_keywords(text, pet_context)
         segment = SeedanceSegment(
             index=index,
             duration=duration,
             transcript=text,
-            function=str(raw.get("function") or _segment_function(index, len(raw_segments), keywords, pet_context)).strip(),
-            main_action=str(raw.get("main_action") or _main_action(text, keywords, pet_context)).strip(),
-            emotion=str(raw.get("emotion") or _main_emotion(text, keywords, pet_context)).strip(),
-            scene=str(raw.get("scene") or _scene_for_segment(text)).strip(),
-            storyboard=storyboard,
+            function=_sanitize_visual_text(str(raw.get("function") or _segment_function(index, len(raw_segments), keywords, pet_context, channel_id))),
+            main_action=_sanitize_visual_text(str(raw.get("main_action") or _main_action(text, keywords, pet_context))),
+            emotion=_sanitize_visual_text(str(raw.get("emotion") or _main_emotion(text, keywords, pet_context))),
+            scene=_sanitize_visual_text(str(raw.get("scene") or _scene_for_segment(text, channel_id))),
+            storyboard=_sanitize_storyboard_items(storyboard),
             prompt="",
             source="ai",
         )
-        segment.prompt = build_prompt_for_segment(segment, pet_context, material_refs)
+        segment.prompt = build_prompt_for_segment(segment, pet_context, material_refs, channel_id)
         segments.append(segment)
     return segments
 
 
-def build_seedance_segments_rule(transcript: str, material_refs: dict[str, str] | None = None) -> list[SeedanceSegment]:
+def build_seedance_segments_rule(transcript: str, material_refs: dict[str, str] | None = None, channel_id: str | None = None) -> list[SeedanceSegment]:
     raw_segments = split_transcript_for_seedance(transcript)
     total = len(raw_segments)
     pet_context = detect_pet_context(transcript)
     segments: list[SeedanceSegment] = []
     for idx, (duration, text) in enumerate(raw_segments, 1):
         keywords = analyze_keywords(text, pet_context)
-        storyboard = build_storyboard(duration, text, keywords, pet_context)
+        storyboard = _sanitize_storyboard_items(build_storyboard(duration, text, keywords, pet_context, channel_id))
         segment = SeedanceSegment(
             index=idx,
             duration=duration,
             transcript=text,
-            function=_segment_function(idx, total, keywords, pet_context),
+            function=_segment_function(idx, total, keywords, pet_context, channel_id),
             main_action=_main_action(text, keywords, pet_context),
             emotion=_main_emotion(text, keywords, pet_context),
-            scene=_scene_for_segment(text),
+            scene=_scene_for_segment(text, channel_id),
             storyboard=storyboard,
             prompt="",
         )
-        segment.prompt = build_prompt_for_segment(segment, pet_context, material_refs)
+        segment.prompt = build_prompt_for_segment(segment, pet_context, material_refs, channel_id)
         segments.append(segment)
     return segments
 
@@ -480,23 +709,25 @@ def build_seedance_segments(
     transcript: str,
     material_refs: dict[str, str] | None = None,
     use_ai: bool = True,
+    channel_id: str | None = None,
 ) -> list[SeedanceSegment]:
     pet_context = detect_pet_context(transcript)
     if use_ai and os.getenv("ANTHROPIC_API_KEY"):
         try:
-            plan = _call_ai_splitter(_ai_split_prompt(transcript, pet_context))
-            return _segments_from_ai_plan(plan, transcript, pet_context, material_refs)
+            plan = _call_ai_splitter(_ai_split_prompt(transcript, pet_context, channel_id))
+            return _segments_from_ai_plan(plan, transcript, pet_context, material_refs, channel_id)
         except Exception as exc:
             print(f"⚠️ Seedance AI 拆分失败，回退规则拆分: {exc}")
-    return build_seedance_segments_rule(transcript, material_refs=material_refs)
+    return build_seedance_segments_rule(transcript, material_refs=material_refs, channel_id=channel_id)
 
 
-def format_seedance_markdown(transcript: str, segments: list[SeedanceSegment]) -> str:
+def format_seedance_markdown(transcript: str, segments: list[SeedanceSegment], channel_id: str | None = None) -> str:
     if not segments:
         return "请先载入或粘贴一段逐字稿。"
     split_way = " + ".join(f"{segment.duration}秒" for segment in segments)
     pet_context = detect_pet_context(transcript)
     all_keywords = analyze_keywords(transcript, pet_context)
+    profile = _channel_profile(channel_id)
     visual_parts = []
     if all_keywords["behaviors"]:
         visual_parts.append(pet_context["strategy_label"])
@@ -507,7 +738,7 @@ def format_seedance_markdown(transcript: str, segments: list[SeedanceSegment]) -
         "## 对应逐字稿的 Seedance 2.0 文生视频提示词",
         "",
         "### 逐字稿整体拆分说明",
-        f"总体拆分逻辑：{'AI模型导演拆分' if any(segment.source == 'ai' for segment in segments) else '规则兜底拆分'}，按口播信息密度优先拆成15秒以内任务段，保证每段平均约2秒一个镜头重点。",
+        f"总体拆分逻辑：{'AI模型导演拆分' if any(segment.source == 'ai' for segment in segments) else '规则兜底拆分'}，按内容信息密度优先拆成15秒以内任务段，{profile['shot_guidance']}",
         f"预计任务段数量：{len(segments)}段",
         f"拆分方式：{split_way}",
         f"核心视觉策略：{' + '.join(visual_parts)}",
@@ -522,7 +753,7 @@ def format_seedance_markdown(transcript: str, segments: list[SeedanceSegment]) -
             f"主场景：{segment.scene}",
             f"生成时长：{segment.duration}秒",
             "分镜规划：",
-            *segment.storyboard,
+            *[_sanitize_visual_text(item) for item in segment.storyboard],
             f"Seedance 2.0 全能参考文生视频 Prompt：{segment.prompt}",
         ])
     return "\n\n".join(lines)
@@ -556,8 +787,9 @@ def build_seedance_outputs(
     material_refs: dict[str, str] | None = None,
     use_ai: bool = True,
     model_version: str = "seedance2.0fast",
+    channel_id: str | None = None,
 ) -> tuple[str, str]:
-    segments = build_seedance_segments(transcript, material_refs=material_refs, use_ai=use_ai)
-    markdown = format_seedance_markdown(transcript, segments)
+    segments = build_seedance_segments(transcript, material_refs=material_refs, use_ai=use_ai, channel_id=channel_id)
+    markdown = format_seedance_markdown(transcript, segments, channel_id=channel_id)
     queue_json = build_seedance_queue_document(segments, multimodal=bool(material_refs), model_version=model_version)
     return markdown, queue_json

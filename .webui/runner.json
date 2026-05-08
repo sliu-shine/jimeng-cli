@@ -1,15 +1,15 @@
 {
-  "pid": 53340,
-  "running": true,
+  "pid": 83516,
+  "running": false,
   "started_at": null,
   "queue_file": "/Users/sliu/web-project/rich-projects/jimeng-cli/.webui/global.queue.json",
   "output_root": "/Users/sliu/web-project/rich-projects/jimeng-cli/web-output",
-  "state_file": "/Users/sliu/web-project/rich-projects/jimeng-cli/web-output/queue-state.json",
+  "state_file": "/Users/sliu/web-project/rich-projects/jimeng-cli/.webui/queue-state.json",
   "dreamina": "/Users/sliu/.local/bin/dreamina",
-  "active_project_id": "project-78ca9005a2",
-  "active_project_name": "版本1-反常识型+好奇型参考借鉴-0506-1520",
+  "active_project_id": "project-f78027f9c6",
+  "active_project_name": "你家狗是不是经常干一些让你怀疑它智商的事儿【版本2 - 痛点型+拟人共情型】",
   "command": [
-    "/opt/homebrew/opt/python@3.14/bin/python3.14",
+    "/opt/miniconda3/bin/python",
     "/Users/sliu/web-project/rich-projects/jimeng-cli/dreamina_queue.py",
     "--dreamina",
     "/Users/sliu/.local/bin/dreamina",
@@ -18,11 +18,12 @@
     "--output-root",
     "/Users/sliu/web-project/rich-projects/jimeng-cli/web-output",
     "--state-file",
-    "/Users/sliu/web-project/rich-projects/jimeng-cli/web-output/queue-state.json",
+    "/Users/sliu/web-project/rich-projects/jimeng-cli/.webui/queue-state.json",
     "--poll-interval",
     "30",
     "--timeout-seconds",
     "10800"
   ],
-  "log_file": "/Users/sliu/web-project/rich-projects/jimeng-cli/.webui/runner.log"
+  "log_file": "/Users/sliu/web-project/rich-projects/jimeng-cli/.webui/runner.log",
+  "queued_while_running": false
 }

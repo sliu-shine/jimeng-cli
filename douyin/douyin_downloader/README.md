@@ -81,7 +81,7 @@ python import_douyin_samples.py ./douyin_analysis/viral_samples.json
 
 - `--users`: 抖音用户主页链接（可多个）
 - `--max-per-user`: 每个账号最多下载数量（默认 20）
-- `--min-likes`: 最低点赞数筛选（默认 100000）
+- `--min-likes`: 最低点赞数筛选（默认 2000）
 - `--output`: 输出目录（默认 ./douyin_analysis）
 
 ### 转录参数

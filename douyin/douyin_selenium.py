@@ -10,6 +10,7 @@ import random
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 import requests
 from pathlib import Path
@@ -391,6 +392,115 @@ class DouyinSeleniumDownloader:
         except:
             pass  # 没有 alert，忽略
 
+    def _drain_performance_logs(self):
+        """丢弃旧 performance log，避免复用上一条视频的媒体请求。"""
+        if not self.driver:
+            return
+        try:
+            self.driver.get_log('performance')
+        except Exception:
+            pass
+
+    def _trigger_video_playback(self):
+        """触发当前视频播放和音频加载。"""
+        try:
+            video_element = self.driver.find_element(By.TAG_NAME, 'video')
+            self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", video_element)
+            try:
+                video_element.click()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        try:
+            self.driver.execute_script("""
+                const video = document.querySelector('video');
+                if (video) {
+                    video.muted = false;
+                    video.volume = 1;
+                    video.play().catch(() => {});
+                    if (Number.isFinite(video.duration) && video.duration > 2) {
+                        video.currentTime = Math.min(video.duration - 1, Math.max(0.5, video.currentTime + 0.5));
+                    }
+                }
+            """)
+        except Exception:
+            pass
+
+    def _write_browser_cookies_file(self, path: Path):
+        """把 Selenium cookie 写成 yt-dlp 可读的 Netscape cookie 文件。"""
+        lines = ["# Netscape HTTP Cookie File\n"]
+        try:
+            cookies = self.driver.get_cookies() if self.driver else []
+        except Exception:
+            cookies = []
+
+        for cookie in cookies:
+            domain = cookie.get("domain") or ""
+            name = cookie.get("name") or ""
+            value = cookie.get("value")
+            if not domain or not name or value is None:
+                continue
+            include_subdomains = "TRUE" if domain.startswith(".") else "FALSE"
+            path_value = cookie.get("path") or "/"
+            secure = "TRUE" if cookie.get("secure") else "FALSE"
+            expiry = str(int(cookie.get("expiry") or (time.time() + 86400 * 30)))
+            lines.append("\t".join([domain, include_subdomains, path_value, secure, expiry, name, str(value)]) + "\n")
+
+        path.write_text("".join(lines), encoding="utf-8")
+
+    def _download_audio_with_ytdlp(self, video_url: str, output_path: Path) -> Dict:
+        """当浏览器只暴露纯视频流时，用 yt-dlp 兜底下载音频。"""
+        output_path = Path(output_path)
+        output_path.unlink(missing_ok=True)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_dir_path = Path(tmp_dir)
+            cookies_path = tmp_dir_path / "cookies.txt"
+            self._write_browser_cookies_file(cookies_path)
+            output_template = tmp_dir_path / "audio.%(ext)s"
+            cmd = [
+                "yt-dlp",
+                "--no-playlist",
+                "--cookies", str(cookies_path),
+                "--add-header", "Referer:https://www.douyin.com/",
+                "--add-header", (
+                    "User-Agent:Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                ),
+                "-f", "bestaudio/best",
+                "-x",
+                "--audio-format", "m4a",
+                "-o", str(output_template),
+                video_url,
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            info = {
+                "method": "yt-dlp",
+                "status_code": result.returncode,
+                "stdout": (result.stdout or "")[-1000:],
+                "stderr": (result.stderr or "")[-1000:],
+                "bytes": 0,
+                "url": video_url,
+            }
+            if result.returncode != 0:
+                info["error"] = f"yt-dlp 退出码 {result.returncode}"
+                return info
+
+            candidates = [
+                path for path in tmp_dir_path.glob("audio.*")
+                if path.is_file() and path.suffix.lower() in self.MEDIA_SUFFIXES
+            ]
+            if not candidates:
+                info["error"] = "yt-dlp 未生成音频文件"
+                return info
+
+            source = max(candidates, key=lambda item: item.stat().st_size)
+            shutil.move(str(source), str(output_path))
+            info["bytes"] = output_path.stat().st_size if output_path.exists() else 0
+            return info
+
     def scroll_to_load_videos(self, scroll_times=10):
         """滚动页面加载更多视频"""
         self._log(f"📜 开始滚动加载视频（{scroll_times}次）...")
@@ -600,36 +710,131 @@ class DouyinSeleniumDownloader:
             tags = self._normalize_video_tags(title, description)
             if not tags:
                 tags = self._normalize_video_tags(video_info.get('tags', []))
+            account_name = (
+                str(video_info.get('accountName') or '').strip()
+                or str(metadata.get('author') or '').strip()
+            )
 
             # 转录优先：优先抓取音频媒体；没有音频时才退回单文件视频
             media_urls = self.extract_media_urls()
             audio_src = media_urls.get("audio")
             video_src = media_urls.get("video")
+            audio_candidates = media_urls.get("audio_candidates", [])
+            use_ytdlp_direct = not audio_src and not video_src
 
-            if audio_src or video_src:
+            if audio_src or video_src or use_ytdlp_direct:
                 # 构建文件名：[点赞数]_[标题]_[视频ID].m4a/mp4
                 title_part = self.sanitize_filename(title) if title else ''
                 likes_str = f"{int(likes/10000)}w" if likes >= 10000 else str(int(likes))
-                suffix = ".m4a" if audio_src else ".mp4"
+                suffix = ".m4a" if audio_src or use_ytdlp_direct else ".mp4"
 
                 if title_part:
                     filename = f"[{likes_str}赞]_{title_part}_{video_id}{suffix}"
                 else:
                     filename = f"[{likes_str}赞]_{video_id}{suffix}"
 
-                # 根据标签分类保存
-                if self.organize_by_tag and tags:
-                    # 使用第一个标签作为分类目录
-                    tag_dir = self.output_dir / self.sanitize_filename(tags[0], max_length=20)
-                    tag_dir.mkdir(exist_ok=True)
-                    filepath = tag_dir / filename
+                # 新的目录结构：账号名/视频标题/文件
+                author_name = account_name
+                if not author_name:
+                    author_name = '未知账号'
+
+                # 清理账号名
+                author_dir_name = self.sanitize_filename(author_name, max_length=30)
+
+                # 清理视频标题作为子目录
+                if title_part:
+                    video_dir_name = self.sanitize_filename(title[:50], max_length=50)
                 else:
-                    filepath = self.output_dir / filename
+                    video_dir_name = f"视频_{video_id}"
+
+                # 创建目录结构：output_dir/账号名/视频标题/
+                account_dir = self.output_dir / author_dir_name
+                video_dir = account_dir / video_dir_name
+                video_dir.mkdir(parents=True, exist_ok=True)
+
+                filepath = video_dir / filename
 
                 if filepath.exists():
                     self.existing_video_index[str(video_id)] = filepath
                     self._log(f"  ⏭️  文件已存在，跳过: {filename}")
                     return True
+
+                def save_ytdlp_audio(fallback_reason: str) -> bool:
+                    audio_filepath = filepath.with_suffix(".m4a")
+                    audio_temp_filepath = audio_filepath.with_name(audio_filepath.name + ".part")
+                    fallback_info = self._download_audio_with_ytdlp(video_url, audio_temp_filepath)
+                    if fallback_info.get("error"):
+                        self._log(
+                            "  ❌ yt-dlp 音频下载失败: "
+                            f"{fallback_info.get('error')} | "
+                            f"字节数: {fallback_info.get('bytes', 0)} | "
+                            f"{fallback_info.get('stderr') or fallback_info.get('stdout') or ''}",
+                            "error"
+                        )
+                        audio_temp_filepath.unlink(missing_ok=True)
+                        return False
+
+                    audio_valid, audio_validation_reason = self._probe_audio_file(audio_temp_filepath)
+                    if not audio_valid:
+                        audio_temp_filepath.unlink(missing_ok=True)
+                        self._log(
+                            "  ❌ yt-dlp 音频校验失败: "
+                            f"{audio_validation_reason} | 字节数: {fallback_info.get('bytes', 0)}",
+                            "error"
+                        )
+                        return False
+
+                    shutil.move(str(audio_temp_filepath), str(audio_filepath))
+                    self.existing_video_index[str(video_id)] = audio_filepath
+                    metadata_file = audio_filepath.with_suffix('.json')
+                    metadata_data = {
+                        'video_id': video_id,
+                        'video_url': video_url,
+                        'likes': int(likes),
+                        'title': title,
+                        'description': description,
+                        'tags': tags,
+                        'author': author_name,
+                        'page_author': metadata.get('author', ''),
+                        'account_name': account_name,
+                        'media_type': 'audio',
+                        'download_time': time.strftime('%Y-%m-%d %H:%M:%S'),
+                        'download': fallback_info,
+                        'validation': audio_validation_reason,
+                        'audio_candidates_count': len(audio_candidates) if audio_candidates else 0,
+                        'transcription_verified': None,
+                        'fallback_reason': fallback_reason,
+                    }
+                    with open(metadata_file, 'w', encoding='utf-8') as f:
+                        json.dump(metadata_data, f, ensure_ascii=False, indent=2)
+                    self._log(f"  ✅ yt-dlp 已保存音频: {audio_filepath.name}")
+                    if title:
+                        self._log(f"  📝 标题: {title}")
+                    if tags:
+                        self._log(f"  🏷️  标签: {', '.join(tags[:5])}")
+                    return True
+
+                if audio_src and len(audio_candidates) > 1:
+                    self._log(
+                        f"  ⚠️  当前页面发现 {len(audio_candidates)} 个音频流，候选流可能串到推荐/预加载视频，改用 yt-dlp 按视频页精确下载音频..."
+                    )
+                    if save_ytdlp_audio(f"多个音频候选: {len(audio_candidates)}"):
+                        return True
+                    try:
+                        filepath.parent.rmdir()
+                    except OSError:
+                        pass
+                    return False
+
+                if use_ytdlp_direct:
+                    self._log("  ⚠️  浏览器未捕获到可用媒体地址，改用 yt-dlp 按视频页下载音频...")
+                    if save_ytdlp_audio("浏览器未捕获到可用媒体地址"):
+                        return True
+                    try:
+                        filepath.parent.rmdir()
+                    except OSError:
+                        pass
+                    return False
 
                 source_url = audio_src or video_src
                 temp_filepath = filepath.with_name(filepath.name + ".part")
@@ -659,6 +864,11 @@ class DouyinSeleniumDownloader:
                     is_valid, validation_reason = self._probe_video_file(temp_filepath)
                 if not is_valid:
                     temp_filepath.unlink(missing_ok=True)
+                    if not audio_src and "没有音频流" in validation_reason:
+                        self._log("  ⚠️  浏览器只捕获到无声音视频流，改用 yt-dlp 兜底下载音频...")
+                        if save_ytdlp_audio(validation_reason):
+                            return True
+
                     self._log(
                         "  ❌ 下载结果无效，已删除临时文件: "
                         f"{validation_reason} | HTTP {download_info.get('status_code')} | "
@@ -684,11 +894,15 @@ class DouyinSeleniumDownloader:
                     'title': title,
                     'description': description,
                     'tags': tags,
-                    'author': metadata['author'],
+                    'author': author_name,
+                    'page_author': metadata.get('author', ''),
+                    'account_name': account_name,
                     'media_type': 'audio' if audio_src else 'video',
                     'download_time': time.strftime('%Y-%m-%d %H:%M:%S'),
                     'download': download_info,
-                    'validation': validation_reason
+                    'validation': validation_reason,
+                    'audio_candidates_count': len(audio_candidates) if audio_candidates else 0,
+                    'transcription_verified': None  # 待人工审核
                 }
 
                 with open(metadata_file, 'w', encoding='utf-8') as f:
@@ -727,17 +941,12 @@ class DouyinSeleniumDownloader:
                 try:
                     # 启用网络监听
                     self.driver.execute_cdp_cmd('Network.enable', {})
+                    self._drain_performance_logs()
 
-                    # 触发视频播放
-                    self.driver.execute_script("""
-                        const video = document.querySelector('video');
-                        if (video) {
-                            video.play();
-                        }
-                    """)
-
-                    # 等待视频开始加载
-                    self._random_sleep(*self.SHORT_DELAY_RANGE)
+                    # 触发视频和音频加载
+                    for _ in range(2):
+                        self._trigger_video_playback()
+                        self._random_sleep(*self.SHORT_DELAY_RANGE)
 
                     # 获取所有网络请求
                     logs = self.driver.get_log('performance')
@@ -764,13 +973,19 @@ class DouyinSeleniumDownloader:
 
                     media_urls = {}
                     if audio_candidates:
+                        # 记录所有音频候选，方便调试
+                        self._log(f"  ℹ️  发现 {len(audio_candidates)} 个音频流")
+
                         audio_candidates.sort(
                             key=lambda item: self._audio_media_url_score(item[0], item[1]),
                             reverse=True
                         )
                         url, mime_type = audio_candidates[0]
                         self._log(f"  ✓ 从网络请求捕获到音频媒体地址 ({mime_type or 'unknown'})")
+
+                        # 保存所有音频候选URL，用于后续验证
                         media_urls["audio"] = url
+                        media_urls["audio_candidates"] = [u for u, _ in audio_candidates]
 
                     if video_candidates:
                         video_candidates.sort(
@@ -790,12 +1005,7 @@ class DouyinSeleniumDownloader:
                 # 方法2: 从 JavaScript 获取
                 try:
                     # 确保视频正在播放
-                    self.driver.execute_script("""
-                        const video = document.querySelector('video');
-                        if (video) {
-                            video.play();
-                        }
-                    """)
+                    self._trigger_video_playback()
                     self._random_sleep(*self.SHORT_DELAY_RANGE)
 
                     video_src = self.driver.execute_script("""
@@ -1077,11 +1287,10 @@ class DouyinSeleniumDownloader:
 
                     if consecutive_failure_count >= self.MAX_CONSECUTIVE_DOWNLOAD_FAILURES:
                         self._log(
-                            f"❌ 连续 {consecutive_failure_count} 个视频下载失败，停止后续任务",
-                            "error"
+                            f"⚠️  连续 {consecutive_failure_count} 个视频下载失败，继续处理剩余视频",
+                            "warning"
                         )
-                        self.is_stopped = True
-                        break
+                        consecutive_failure_count = 0
 
                     # 更新进度
                     progress = 70 + int((i / len(video_list)) * 25)

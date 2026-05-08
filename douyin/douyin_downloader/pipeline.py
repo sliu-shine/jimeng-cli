@@ -105,9 +105,11 @@ class DouyinViralPipeline:
             # 加载所有已有的逐字稿
             transcripts = {}
             video_dir = self.output_dir / "videos"
-            for transcript_file in video_dir.rglob("*.transcript.json"):
+            transcript_files = list(video_dir.rglob("transcript.json"))
+            transcript_files.extend(video_dir.rglob("*.transcript.json"))
+            for transcript_file in transcript_files:
                 with open(transcript_file, 'r', encoding='utf-8') as f:
-                    video_name = transcript_file.stem.replace('.transcript', '')
+                    video_name = transcript_file.parent.name if transcript_file.name == "transcript.json" else transcript_file.stem.replace('.transcript', '')
                     transcripts[video_name] = json.load(f)
 
         # 转换为爆款智能体格式
@@ -205,7 +207,7 @@ async def main():
 
     pipeline = DouyinViralPipeline(
         output_dir="./douyin_analysis",
-        min_likes=1000
+        min_likes=2000
     )
 
     export_file = await pipeline.run_full_pipeline(

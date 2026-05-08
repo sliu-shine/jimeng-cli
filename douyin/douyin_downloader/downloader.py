@@ -307,7 +307,7 @@ async def main():
         videos = await downloader.download_user_viral_videos(
             user_url=user_url,
             max_count=20,
-            min_likes=1000
+            min_likes=2000
         )
 
         print(f"\n下载完成，共 {len(videos)} 个视频")

@@ -1,42 +1,53 @@
 """
 爆款文案智能体
-用 claude CLI 做推理，手动管理检索→生成流程
+用 Claude API 做推理，手动管理检索→生成流程
 """
 import os
 import re
-import subprocess
 from . import knowledge_base as kb
-from .ai_providers import apply_provider
+from .ai_providers import apply_provider, list_providers
+from scripts.claude_client import ClaudeClient
 
 
-CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-ANTHROPIC_BASE_URL = os.environ.get("ANTHROPIC_BASE_URL", "")
+def _call_provider(prompt: str, provider_id: str | None = None) -> str:
+    provider = apply_provider(provider_id or os.environ.get("AI_PROVIDER_SELECTED"))
+    client = ClaudeClient(provider_id=provider.id)
+    result = client.create_message(
+        model=provider.model or os.getenv("ANTHROPIC_MODEL", client.model),
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=int(os.getenv("VIRAL_AGENT_MAX_TOKENS", "8000")),
+        temperature=float(os.getenv("VIRAL_AGENT_TEMPERATURE", "0.7")),
+    )
+    content = result.get("content") or []
+    parts = []
+    for item in content:
+        if isinstance(item, dict) and item.get("type", "text") == "text":
+            parts.append(str(item.get("text") or ""))
+    text = "\n".join(part for part in parts if part.strip()).strip()
+    if not text:
+        raise RuntimeError(f"AI Provider 返回空内容：{provider.name} · {provider.model}")
+    return text
 
 
 def _call_claude(prompt: str) -> str:
-    provider = apply_provider(os.environ.get("AI_PROVIDER_SELECTED"))
-    env = os.environ.copy()
-    api_key = provider.api_key or os.environ.get("ANTHROPIC_API_KEY", ANTHROPIC_API_KEY)
-    base_url = provider.base_url or os.environ.get("ANTHROPIC_BASE_URL", ANTHROPIC_BASE_URL)
-    if api_key:
-        env["ANTHROPIC_API_KEY"] = api_key
-    if base_url:
-        env["ANTHROPIC_BASE_URL"] = base_url
-    env["ANTHROPIC_MODEL"] = provider.model
-    env["CLAUDE_MODEL"] = provider.model
+    selected_id = (os.environ.get("AI_PROVIDER_SELECTED") or os.environ.get("AI_PROVIDER_DEFAULT") or "").strip().lower()
+    providers = list_providers()
+    ordered_ids: list[str] = []
+    if selected_id:
+        ordered_ids.append(selected_id)
+    ordered_ids.extend(provider.id for provider in providers if provider.id not in ordered_ids)
 
-    command = [CLAUDE_BIN, "-p", prompt, "--output-format", "text"]
-    if provider.model:
-        command.extend(["--model", provider.model])
-
-    result = subprocess.run(
-        command,
-        capture_output=True, text=True, env=env, timeout=180,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"claude CLI 错误: {result.stderr[:300]}")
-    return result.stdout.strip()
+    errors: list[str] = []
+    for provider_id in ordered_ids:
+        try:
+            return _call_provider(prompt, provider_id)
+        except Exception as exc:
+            provider = next((item for item in providers if item.id == provider_id), None)
+            name = provider.name if provider else provider_id
+            errors.append(f"{name}: {str(exc)[:300]}")
+            if os.getenv("AI_PROVIDER_AUTO_FALLBACK", "1").strip().lower() in {"0", "false", "no"}:
+                break
+    raise RuntimeError("所有 AI Provider 均调用失败：\n" + "\n".join(errors))
 
 
 def _compact_text(text: str) -> str:

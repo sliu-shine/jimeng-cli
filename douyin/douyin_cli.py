@@ -18,7 +18,7 @@ def main():
     download_parser = subparsers.add_parser("download", help="下载爆款视频")
     download_parser.add_argument("--users", nargs="+", required=True, help="抖音用户主页链接")
     download_parser.add_argument("--max-per-user", type=int, default=20, help="每个账号最多下载数量")
-    download_parser.add_argument("--min-likes", type=int, default=1000, help="最低点赞数")
+    download_parser.add_argument("--min-likes", type=int, default=2000, help="最低点赞数")
     download_parser.add_argument("--output", default="./douyin_analysis", help="输出目录")
 
     # transcribe 命令
@@ -33,7 +33,7 @@ def main():
     pipeline_parser = subparsers.add_parser("pipeline", help="运行完整流水线")
     pipeline_parser.add_argument("--users", nargs="+", required=True, help="抖音用户主页链接")
     pipeline_parser.add_argument("--max-per-user", type=int, default=20, help="每个账号最多下载数量")
-    pipeline_parser.add_argument("--min-likes", type=int, default=1000, help="最低点赞数")
+    pipeline_parser.add_argument("--min-likes", type=int, default=2000, help="最低点赞数")
     pipeline_parser.add_argument("--output", default="./douyin_analysis", help="输出目录")
     pipeline_parser.add_argument("--method", choices=["whisper", "groq", "yunwu"], default="whisper", help="识别方法")
     pipeline_parser.add_argument("--model", default="large-v3", help="Whisper 模型名称")

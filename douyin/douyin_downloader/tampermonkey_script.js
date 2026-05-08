@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         抖音视频批量下载助手（增强版）
 // @namespace    http://tampermonkey.net/
-// @version      2.0
+// @version      2.1
 // @description  在抖音用户主页添加批量下载功能，支持多账号队列显示
 // @author       You
 // @match        https://www.douyin.com/user/*
@@ -47,6 +47,44 @@
     function getCurrentAccount() {
         const currentUrl = window.location.href;
         return accountQueue.find(acc => acc.url === currentUrl);
+    }
+
+    function cleanText(text) {
+        return (text || '').replace(/\s+/g, ' ').trim();
+    }
+
+    function getCurrentAccountName() {
+        const selectors = [
+            '[data-e2e="user-title"]',
+            '[data-e2e="user-info"] h1',
+            'h1',
+            '[class*="user"] [class*="name"]',
+            '[class*="nickname"]',
+            '[class*="author"]'
+        ];
+
+        for (const selector of selectors) {
+            const el = document.querySelector(selector);
+            const text = cleanText(el?.textContent);
+            if (text && text.length <= 60 && !/^抖音$/.test(text)) {
+                return text;
+            }
+        }
+
+        const title = cleanText(document.title);
+        if (title) {
+            const name = title
+                .replace(/的主页.*$/, '')
+                .replace(/ - 抖音.*$/, '')
+                .replace(/_抖音.*$/, '')
+                .replace(/抖音.*$/, '')
+                .trim();
+            if (name) {
+                return name;
+            }
+        }
+
+        return '';
     }
 
     // 创建队列显示面板
@@ -220,6 +258,7 @@
     function scanVideos() {
         const currentAccount = getCurrentAccount();
         const minLikes = currentAccount?.min_likes || 1000;
+        const accountName = getCurrentAccountName();
 
         scannedVideos = [];
 
@@ -284,6 +323,9 @@
 
         // 完成
         if (currentAccount) {
+            if (accountName) {
+                currentAccount.name = accountName;
+            }
             currentAccount.status = 'completed';
             currentAccount.progress = 100;
             currentAccount.video_count = scannedVideos.length;
@@ -312,6 +354,8 @@
     // 获取视频信息
     function getVideoInfo(videoElement) {
         try {
+            const currentAccount = getCurrentAccount();
+            const accountName = getCurrentAccountName() || currentAccount?.name || '';
             const link = videoElement.querySelector('a[href*="/video/"]') || videoElement.querySelector('a');
             if (!link) return null;
 
@@ -373,7 +417,8 @@
                 cover,
                 desc,
                 title,
-                tags
+                tags,
+                accountName
             };
         } catch (e) {
             console.error('解析视频信息失败:', e);

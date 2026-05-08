@@ -85,7 +85,11 @@ python3 douyin_selenium.py
 
 2. **导入知识库**
 ```bash
-python3 douyin/import_videos.py ./douyin_videos --method groq
+# 先预检已有转录文件，不调用 AI、不写知识库
+python3 douyin/import_videos.py ./douyin_videos --no-transcribe --dry-run
+
+# 使用已有 .transcription.json/.transcript.json/.txt 导入知识库
+python3 douyin/import_videos.py ./douyin_videos --no-transcribe
 ```
 
 3. **生成爆款文案**
@@ -186,7 +190,7 @@ python3 -m viral_agent generate "主题" --num 3
 python3 -m viral_agent stats
 
 # 导入视频
-python3 douyin/import_videos.py ./videos --method groq
+python3 douyin/import_videos.py ./douyin_videos --no-transcribe
 ```
 
 ### 抖音采集

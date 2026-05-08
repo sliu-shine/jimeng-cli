@@ -31,23 +31,14 @@ PROJECTS_DIR = APP_DIR / "projects"
 PROJECTS_INDEX_FILE = APP_DIR / "projects.json"
 GLOBAL_QUEUE_FILE = APP_DIR / "global.queue.json"
 DEFAULT_OUTPUT_ROOT = ROOT / "web-output"
-DEFAULT_STATE_FILE = DEFAULT_OUTPUT_ROOT / "queue-state.json"
+DEFAULT_STATE_FILE = APP_DIR / "queue-state.json"
 RUNNER_META_FILE = APP_DIR / "runner.json"
 RUNNER_LOG_FILE = APP_DIR / "runner.log"
 UI_CONFIG_FILE = APP_DIR / "ui-config.json"
 UPLOAD_DIR = APP_DIR / "uploads"
-DOUYIN_ACCOUNTS_FILE = APP_DIR / "douyin_accounts.json"
-DOUYIN_STATUS_FILE = APP_DIR / "douyin_status.json"
 LOCK = threading.Lock()
-
-# 抖音下载任务状态
-douyin_task = {
-    "downloader": None,
-    "thread": None,
-    "is_running": False,
-    "logs": [],
-    "accounts_status": []
-}
+MEDIA_SUFFIXES = {".mp4", ".mov", ".webm"}
+TERMINAL_TASK_STATUSES = {"success", "failed", "fail", "rejected", "banned", "error", "cancelled"}
 
 
 def ensure_dir(path: Path) -> None:
@@ -376,6 +367,151 @@ def project_output_root(project_id: str, base_output_root: Path | None = None) -
     return project_dir(project_id) / "outputs"
 
 
+def project_segment_output_dir(project_id: str, segment_name: str, segment_id: str = "") -> Path:
+    label = sanitize_filename(str(segment_name or segment_id or "task"))
+    return project_output_root(project_id) / label
+
+
+def has_downloaded_video(path: Path | str | None) -> bool:
+    if not path:
+        return False
+    directory = Path(str(path)).expanduser()
+    if not directory.is_absolute():
+        directory = ROOT / directory
+    if not directory.exists() or not directory.is_dir():
+        return False
+    return any(child.is_file() and child.suffix.lower() in MEDIA_SUFFIXES for child in directory.iterdir())
+
+
+def segment_is_success(project_id: str, segment: dict[str, Any]) -> bool:
+    status = str(segment.get("status") or "").lower()
+    if status == "success":
+        return True
+    segment_id = str(segment.get("id") or "").strip()
+    segment_name = str(segment.get("name") or "").strip()
+    return has_downloaded_video(segment.get("download_dir") or segment.get("output_dir") or project_segment_output_dir(project_id, segment_name, segment_id))
+
+
+def segment_is_terminal(project_id: str, segment: dict[str, Any]) -> bool:
+    status = str(segment.get("status") or "").lower()
+    return status in TERMINAL_TASK_STATUSES or segment_is_success(project_id, segment)
+
+
+def sync_project_queue_task(task: dict[str, Any]) -> None:
+    project_id = str(task.get("project_id") or "").strip()
+    segment_id = str(task.get("segment_id") or "").strip()
+    if not project_id or not segment_id:
+        return
+    queue_path = project_queue_file(project_id)
+    document = parse_queue_document(queue_file_text(queue_path))
+    changed = False
+    for segment in document.get("segments", []):
+        if str(segment.get("id") or "") != segment_id:
+            continue
+        for key in [
+            "status",
+            "submit_id",
+            "gen_status",
+            "fail_reason",
+            "started_at",
+            "finished_at",
+            "download_dir",
+            "urls",
+            "retry_count",
+            "manual_retry_requested_at",
+        ]:
+            if key in task:
+                segment[key] = task.get(key)
+        changed = True
+        break
+    if changed:
+        document["updated_at"] = now_iso()
+        queue_path.write_text(queue_document_to_text(document), encoding="utf-8")
+
+
+def merge_existing_segment_status(project_id: str, document: dict[str, Any]) -> dict[str, Any]:
+    queue_path = project_queue_file(project_id)
+    previous = parse_queue_document(queue_file_text(queue_path))
+    previous_by_id = {
+        str(segment.get("id") or ""): segment
+        for segment in previous.get("segments", [])
+        if isinstance(segment, dict) and str(segment.get("id") or "")
+    }
+    status_keys = [
+        "status",
+        "submit_id",
+        "gen_status",
+        "fail_reason",
+        "started_at",
+        "finished_at",
+        "download_dir",
+        "urls",
+        "retry_count",
+        "manual_retry_requested_at",
+    ]
+    for segment in document.get("segments", []):
+        if not isinstance(segment, dict):
+            continue
+        previous_segment = previous_by_id.get(str(segment.get("id") or ""))
+        if not previous_segment:
+            continue
+        for key in status_keys:
+            if key in previous_segment and key not in segment:
+                segment[key] = previous_segment[key]
+    return document
+
+
+def sync_project_queues_from_state(state: dict[str, Any]) -> None:
+    for task in state.get("tasks") or []:
+        if isinstance(task, dict):
+            sync_project_queue_task(task)
+
+
+def save_queue_state(path: Path, state: dict[str, Any]) -> None:
+    state["updated_at"] = now_iso()
+    save_json(path, state)
+    sync_project_queues_from_state(state)
+
+
+def clear_stale_running_tasks(state_file: Path, state: dict[str, Any], runner: dict[str, Any]) -> dict[str, Any]:
+    if runner.get("running"):
+        return state
+    tasks = state.get("tasks")
+    if not isinstance(tasks, list):
+        return state
+
+    changed = False
+    stopped_at = runner.get("finished_at") or now_iso()
+    for task in tasks:
+        if not isinstance(task, dict) or str(task.get("status") or "").lower() != "running":
+            continue
+        submit_id = str(task.get("submit_id") or "").strip()
+        if submit_id:
+            # A submitted task can still finish remotely after the local runner
+            # stops. Keep it resumable so the next runner can query/download it
+            # instead of duplicating the submission.
+            task["gen_status"] = task.get("gen_status") or "processing"
+            task["fail_reason"] = None
+            changed = True
+            continue
+        task["status"] = "failed"
+        task["gen_status"] = task.get("gen_status") or "interrupted"
+        task["fail_reason"] = (
+            f"runner 已停止，但任务仍停留在 running。"
+            "已标记为 failed，避免重复提交。"
+        )
+        task["finished_at"] = task.get("finished_at") or stopped_at
+        changed = True
+
+    if changed:
+        save_queue_state(state_file, state)
+    return state
+
+
+def normalize_state_file_path(value: Any | None = None) -> Path:
+    return DEFAULT_STATE_FILE.resolve()
+
+
 def short_project_suffix(project_id: str) -> str:
     value = sanitize_filename(project_id)
     if value.startswith("project-"):
@@ -583,12 +719,11 @@ def rename_project(project_id: str, name: str) -> dict[str, Any]:
     return renamed
 
 
-def success_segment_ids(state: dict[str, Any]) -> set[str]:
+def successful_segment_ids(state: dict[str, Any]) -> set[str]:
     ids: set[str] = set()
-    terminal_statuses = {"success", "failed", "fail", "rejected", "banned", "error", "cancelled"}
     for task in state.get("tasks") or []:
         status = str(task.get("status") or "").lower()
-        if status not in terminal_statuses:
+        if status != "success":
             continue
         segment_id = str(task.get("segment_id") or "").strip()
         project_id = str(task.get("project_id") or "").strip()
@@ -599,12 +734,11 @@ def success_segment_ids(state: dict[str, Any]) -> set[str]:
     return ids
 
 
-def success_segment_signatures(state: dict[str, Any]) -> set[tuple[str, str, str]]:
+def successful_segment_signatures(state: dict[str, Any]) -> set[tuple[str, str, str]]:
     signatures: set[tuple[str, str, str]] = set()
-    terminal_statuses = {"success", "failed", "fail", "rejected", "banned", "error", "cancelled"}
     for task in state.get("tasks") or []:
         status = str(task.get("status") or "").lower()
-        if status not in terminal_statuses:
+        if status != "success":
             continue
         project_id = str(task.get("project_id") or "").strip()
         segment_id = str(task.get("segment_id") or "").strip()
@@ -620,15 +754,25 @@ def project_task_counts(project_id: str, state: dict[str, Any]) -> dict[str, int
         segments = parse_queue_document(queue_file_text(queue_path)).get("segments", [])
     except Exception:
         segments = []
-    project_tasks = [
-        task for task in state.get("tasks") or []
-        if str(task.get("project_id") or "") == project_id
-    ]
+    project_tasks = [task for task in state.get("tasks") or [] if str(task.get("project_id") or "") == project_id]
+    by_segment_id = {str(task.get("segment_id") or ""): task for task in project_tasks}
+    success_count = 0
+    failed_count = 0
+    running_count = 0
+    for segment in segments:
+        task = by_segment_id.get(str(segment.get("id") or ""))
+        status = str((task or segment).get("status") or "").lower() if isinstance((task or segment), dict) else ""
+        if status == "success" or segment_is_success(project_id, segment):
+            success_count += 1
+        elif status in {"failed", "fail", "rejected", "banned", "error", "cancelled"}:
+            failed_count += 1
+        elif status == "running":
+            running_count += 1
     return {
         "queued": len(segments),
-        "running": sum(1 for task in project_tasks if str(task.get("status") or "") == "running"),
-        "success": sum(1 for task in project_tasks if str(task.get("status") or "") == "success"),
-        "failed": sum(1 for task in project_tasks if str(task.get("status") or "") == "failed"),
+        "running": running_count,
+        "success": success_count,
+        "failed": failed_count,
     }
 
 
@@ -646,7 +790,8 @@ def projects_for_payload(state: dict[str, Any], base_output_root: Path | None = 
 
 
 def compose_global_queue_document(state: dict[str, Any], base_output_root: Path | None = None) -> dict[str, Any]:
-    completed = success_segment_signatures(state)
+    completed = successful_segment_signatures(state)
+    completed_ids = successful_segment_ids(state)
     global_segments: list[dict[str, Any]] = []
     for project in load_projects():
         queue_path = project_queue_file(project["id"])
@@ -655,17 +800,22 @@ def compose_global_queue_document(state: dict[str, Any], base_output_root: Path 
             segment_id = str(segment.get("id") or "").strip()
             command = str(segment.get("command") or "").strip()
             if not command:
-                command = str(normalize_queue_segment(segment, 1).get("command") or "").strip()
+                command = command_from_queue_segment(segment)
+            if segment_is_terminal(project["id"], segment):
+                continue
+            if segment_id and f"{project['id']}:{segment_id}" in completed_ids:
+                continue
+            if segment_id and segment_id in completed_ids:
+                continue
             if segment_id and (project["id"], segment_id, command) in completed:
                 continue
             if segment_id and ("", segment_id, command) in completed:
                 continue
             prepared = dict(segment)
+            prepared["command"] = command
             prepared["project_id"] = project["id"]
             prepared["project_name"] = project["name"]
-            prepared["download_dir"] = str(
-                project_output_root(project["id"], base_output_root) / sanitize_filename(str(segment.get("name") or segment_id or "task"))
-            )
+            prepared["download_dir"] = str(project_segment_output_dir(project["id"], str(segment.get("name") or ""), segment_id))
             global_segments.append(prepared)
     return {"version": 1, "segments": global_segments}
 
@@ -990,177 +1140,6 @@ def parse_body(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
     raise ValueError(f"Unsupported Content-Type: {content_type}")
 
 
-# ========== 抖音采集相关函数 ==========
-
-def load_douyin_accounts() -> list[dict[str, Any]]:
-    """加载抖音账号列表"""
-    return load_json(DOUYIN_ACCOUNTS_FILE, [])
-
-
-def save_douyin_accounts(accounts: list[dict[str, Any]]) -> None:
-    """保存抖音账号列表"""
-    save_json(DOUYIN_ACCOUNTS_FILE, accounts)
-
-
-def load_douyin_status() -> dict[str, Any]:
-    """加载抖音下载状态"""
-    return load_json(DOUYIN_STATUS_FILE, {
-        "is_running": False,
-        "accounts": [],
-        "logs": []
-    })
-
-
-def save_douyin_status(status: dict[str, Any]) -> None:
-    """保存抖音下载状态"""
-    save_json(DOUYIN_STATUS_FILE, status)
-
-
-def add_douyin_log(level: str, message: str) -> None:
-    """添加抖音下载日志"""
-    global douyin_task
-    log_entry = {
-        "level": level,
-        "message": message,
-        "time": now_iso()
-    }
-    douyin_task["logs"].append(log_entry)
-    # 只保留最近100条日志
-    if len(douyin_task["logs"]) > 100:
-        douyin_task["logs"] = douyin_task["logs"][-100:]
-
-
-def start_douyin_task(config: dict[str, Any]) -> dict[str, Any]:
-    """启动抖音下载任务"""
-    global douyin_task
-
-    if douyin_task["is_running"]:
-        return {"error": "下载任务已在运行中"}
-
-    try:
-        # 准备参数
-        accounts = config.get("accounts", [])
-        if not accounts:
-            return {"error": "没有可下载的账号"}
-
-        save_path = config.get("save_path", "./douyin_videos")
-        min_likes = config.get("min_likes", 1000)
-        organize_by_tag = config.get("organize_by_tag", True)
-        auto_next = config.get("auto_next", True)
-
-        add_douyin_log("info", f"启动下载任务，共 {len(accounts)} 个账号")
-
-        # 初始化账号状态
-        douyin_task["accounts_status"] = [
-            {"url": acc, "status": "pending", "progress": 0}
-            for acc in accounts
-        ]
-        douyin_task["is_running"] = True
-
-        # 定义回调函数
-        def progress_callback(account_index, status, progress, **kwargs):
-            """进度回调"""
-            if account_index < len(douyin_task["accounts_status"]):
-                douyin_task["accounts_status"][account_index]["status"] = status
-                douyin_task["accounts_status"][account_index]["progress"] = progress
-                douyin_task["accounts_status"][account_index].update(kwargs)
-
-        def log_callback(level, message):
-            """日志回调"""
-            add_douyin_log(level, message)
-
-        # 在后台线程中运行下载任务
-        def run_download():
-            try:
-                # 导入下载器类
-                sys.path.insert(0, str(ROOT / "douyin"))
-                from douyin_selenium import DouyinSeleniumDownloader
-
-                downloader = DouyinSeleniumDownloader(
-                    output_dir=save_path,
-                    organize_by_tag=organize_by_tag,
-                    progress_callback=progress_callback,
-                    log_callback=log_callback
-                )
-
-                # 保存下载器实例，以便停止
-                douyin_task["downloader"] = downloader
-
-                # 运行批量下载
-                downloader.run_batch(
-                    user_urls=accounts,
-                    scroll_times=10,
-                    min_likes=min_likes,
-                    auto_mode=auto_next
-                )
-
-                add_douyin_log("success", "所有下载任务已完成")
-
-            except Exception as e:
-                add_douyin_log("error", f"下载任务异常: {str(e)}")
-                import traceback
-                add_douyin_log("error", traceback.format_exc())
-            finally:
-                douyin_task["is_running"] = False
-                douyin_task["downloader"] = None
-
-        # 启动后台线程
-        thread = threading.Thread(target=run_download, daemon=True)
-        thread.start()
-        douyin_task["thread"] = thread
-
-        return {"message": "下载任务已启动"}
-
-    except Exception as e:
-        add_douyin_log("error", f"启动失败: {str(e)}")
-        douyin_task["is_running"] = False
-        return {"error": str(e)}
-
-
-def stop_douyin_task() -> dict[str, Any]:
-    """停止抖音下载任务"""
-    global douyin_task
-
-    if not douyin_task["is_running"]:
-        return {"message": "没有运行中的任务"}
-
-    try:
-        # 调用下载器的停止方法
-        downloader = douyin_task.get("downloader")
-        if downloader:
-            downloader.stop()
-
-        add_douyin_log("info", "下载任务已停止")
-
-        return {"message": "下载任务已停止"}
-
-    except Exception as e:
-        add_douyin_log("error", f"停止失败: {str(e)}")
-        return {"error": str(e)}
-
-
-def get_douyin_task_status() -> dict[str, Any]:
-    """获取抖音下载状态"""
-    global douyin_task
-
-    # 检查线程是否还在运行
-    if douyin_task["is_running"]:
-        thread = douyin_task["thread"]
-        if thread and not thread.is_alive():
-            # 线程已结束
-            douyin_task["is_running"] = False
-            douyin_task["thread"] = None
-            add_douyin_log("success", "所有下载任务已完成")
-
-    return {
-        "is_running": douyin_task["is_running"],
-        "accounts": douyin_task["accounts_status"],
-        "logs": douyin_task["logs"][-20:]  # 只返回最近20条日志
-    }
-
-
-# ========== 原有函数 ==========
-
 def build_status_payload() -> dict[str, Any]:
     ensure_dir(APP_DIR)
     runner = read_runner_meta()
@@ -1168,8 +1147,9 @@ def build_status_payload() -> dict[str, Any]:
     active_project = get_active_project(ui_config)
     queue_file = project_queue_file(active_project["id"])
     output_root = Path(runner.get("output_root") or ui_config.get("output_root") or DEFAULT_OUTPUT_ROOT)
-    state_file = Path(runner.get("state_file") or ui_config.get("state_file") or DEFAULT_STATE_FILE)
+    state_file = normalize_state_file_path(runner.get("state_file") or ui_config.get("state_file"))
     state = load_json(state_file, {})
+    state = clear_stale_running_tasks(state_file, state, runner)
     detected_dreamina = detect_dreamina_path()
     return {
         "runner": runner,
@@ -1177,6 +1157,7 @@ def build_status_payload() -> dict[str, Any]:
         "active_project": active_project,
         "queue_file": str(queue_file),
         "output_root": str(output_root),
+        "video_output_root": str(project_output_root(active_project["id"])),
         "state_file": str(state_file),
         "detected_dreamina": detected_dreamina,
         "ui_config": ui_config,
@@ -1200,7 +1181,7 @@ def persist_runtime_form(payload: dict[str, Any], dreamina: str | None = None) -
             "dreamina": dreamina if dreamina is not None else (str(payload.get("dreamina") or "").strip() or None),
             "queue_file": str(payload.get("queue_file") or "").strip() or None,
             "output_root": str(payload.get("output_root") or "").strip() or None,
-            "state_file": str(payload.get("state_file") or "").strip() or None,
+            "state_file": str(normalize_state_file_path(payload.get("state_file"))),
             "poll_interval": int(payload.get("poll_interval") or 30),
             "timeout_seconds": int(payload.get("timeout_seconds") or 10800),
             "resume": bool_value(payload.get("resume")),
@@ -1210,19 +1191,253 @@ def persist_runtime_form(payload: dict[str, Any], dreamina: str | None = None) -
     )
 
 
+def write_active_and_global_queue(
+    active_project: dict[str, Any],
+    queue_content: Any,
+    queue_file: Path,
+    output_root: Path,
+    state_file: Path,
+) -> dict[str, Any]:
+    active_queue_file = project_queue_file(active_project["id"]).expanduser().resolve()
+    ensure_dir(active_queue_file.parent)
+    ensure_dir(queue_file.parent)
+    ensure_dir(output_root)
+    ensure_dir(APP_DIR)
+    if str(queue_content or "").strip():
+        active_document = merge_existing_segment_status(active_project["id"], parse_queue_document(str(queue_content or "")))
+        active_queue_file.write_text(queue_document_to_text(active_document), encoding="utf-8")
+    previous_state = load_json(state_file, {})
+    global_document = compose_global_queue_document(previous_state, output_root)
+    if not global_document.get("segments"):
+        raise ValueError("所有项目里都没有待执行任务。")
+    queue_file.write_text(queue_document_to_text(global_document), encoding="utf-8")
+    return global_document
+
+
+def task_record_signature(task: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(task.get("project_id") or ""),
+        str(task.get("segment_id") or ""),
+        str(task.get("command") or ""),
+    )
+
+
+def task_record_identity(task: dict[str, Any]) -> tuple[str, str]:
+    return (
+        str(task.get("project_id") or ""),
+        str(task.get("segment_id") or ""),
+    )
+
+
+def segment_record_signature(segment: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(segment.get("project_id") or ""),
+        str(segment.get("id") or ""),
+        str(segment.get("command") or ""),
+    )
+
+
+def segment_record_identity(segment: dict[str, Any]) -> tuple[str, str]:
+    return (
+        str(segment.get("project_id") or ""),
+        str(segment.get("id") or ""),
+    )
+
+
+def build_pending_task_record(segment: dict[str, Any], index: int, output_root: Path) -> dict[str, Any]:
+    command = command_from_queue_segment(segment)
+    segment_id = str(segment.get("id") or f"legacy-{index}")
+    segment_name = str(segment.get("name") or f"片段{index}")
+    project_id = str(segment.get("project_id") or "")
+    task_label = sanitize_filename(f"{segment_name}-{command[:48]}")
+    download_dir = (
+        project_segment_output_dir(project_id, segment_name, segment_id)
+        if project_id
+        else Path(str(segment.get("download_dir") or "")).expanduser()
+        if segment.get("download_dir")
+        else output_root / f"{index:03d}-{task_label}"
+    )
+    return {
+        "index": index,
+        "segment_id": segment_id,
+        "segment_name": segment_name,
+        "project_id": project_id,
+        "project_name": str(segment.get("project_name") or ""),
+        "command": command,
+        "prompt": str(segment.get("prompt") or ""),
+        "images": list(segment.get("images") or []),
+        "transition_prompts": list(segment.get("transition_prompts") or []),
+        "videos": list(segment.get("videos") or []),
+        "audios": list(segment.get("audios") or []),
+        "duration": str(segment.get("duration") or ""),
+        "ratio": str(segment.get("ratio") or ""),
+        "model_version": str(segment.get("model_version") or ""),
+        "label": f"{index:03d}-{task_label}",
+        "status": "pending",
+        "submit_id": None,
+        "gen_status": None,
+        "fail_reason": None,
+        "started_at": None,
+        "finished_at": None,
+        "download_dir": str(download_dir),
+        "submit_stdout": None,
+        "submit_stderr": None,
+        "final_stdout": None,
+        "final_stderr": None,
+        "urls": [],
+        "retry_attempted": False,
+        "retry_count": 0,
+        "retry_command": None,
+        "retry_submit_id": None,
+    }
+
+
+def command_from_queue_segment(segment: dict[str, Any]) -> str:
+    command = str(segment.get("command") or "").strip()
+    if command:
+        return command
+
+    images = list(segment.get("images") or [])
+    videos = list(segment.get("videos") or [])
+    audios = list(segment.get("audios") or [])
+    mode = str(segment.get("mode") or segment.get("type") or "").strip()
+    payload = {
+        "prompt": str(segment.get("prompt") or ""),
+        "images": images,
+        "videos": videos,
+        "audios": audios,
+        "transition_prompts": list(segment.get("transition_prompts") or []),
+        "duration": str(segment.get("duration") or ""),
+        "ratio": str(segment.get("ratio") or ""),
+        "model_version": str(segment.get("model_version") or ""),
+    }
+    if mode == "text2video" or not (images or videos or audios):
+        return build_text2video_command(payload)
+    return build_multimodal_command(payload)
+
+
+def task_index_value(task: dict[str, Any]) -> int:
+    try:
+        return int(task.get("index") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def append_pending_tasks_to_state(global_document: dict[str, Any], state_file: Path, output_root: Path) -> int:
+    state = load_json(state_file, {})
+    tasks = state.setdefault("tasks", [])
+    if not isinstance(tasks, list):
+        tasks = []
+        state["tasks"] = tasks
+    existing = {task_record_signature(task) for task in tasks}
+    existing_ids = {
+        task_record_identity(task) for task in tasks
+        if task_record_identity(task)[1]
+    }
+    new_segments = [
+        segment for segment in global_document.get("segments") or []
+        if segment_record_signature(segment) not in existing
+        and segment_record_identity(segment) not in existing_ids
+    ]
+    if not new_segments:
+        return 0
+
+    next_index = max([task_index_value(task) for task in tasks] or [0]) + 1
+    for offset, segment in enumerate(new_segments):
+        tasks.append(build_pending_task_record(segment, next_index + offset, output_root))
+    state.setdefault("created_at", now_iso())
+    state.setdefault("queue_file", str(GLOBAL_QUEUE_FILE.resolve()))
+    state.setdefault("output_root", str(output_root))
+    save_queue_state(state_file, state)
+    return len(new_segments)
+
+
+def rebuild_global_queue_from_state(state_file: Path, output_root: Path, queue_file: Path = GLOBAL_QUEUE_FILE) -> dict[str, Any]:
+    state = load_json(state_file, {})
+    global_document = compose_global_queue_document(state, output_root)
+    ensure_dir(queue_file.parent)
+    queue_file.write_text(queue_document_to_text(global_document), encoding="utf-8")
+    return global_document
+
+
+def retry_task(payload: dict[str, Any]) -> dict[str, Any]:
+    ui_config = load_ui_config()
+    runner = read_runner_meta()
+    output_root = Path(runner.get("output_root") or ui_config.get("output_root") or DEFAULT_OUTPUT_ROOT).expanduser().resolve()
+    state_file = normalize_state_file_path(runner.get("state_file") or ui_config.get("state_file"))
+    queue_file = Path(runner.get("queue_file") or GLOBAL_QUEUE_FILE).expanduser().resolve()
+    project_id = str(payload.get("project_id") or "").strip()
+    segment_id = str(payload.get("segment_id") or "").strip()
+    if not project_id or not segment_id:
+        raise ValueError("缺少 project_id 或 segment_id，无法重试。")
+
+    state = load_json(state_file, {})
+    tasks = state.get("tasks")
+    if not isinstance(tasks, list):
+        raise ValueError("state 文件里没有任务列表。")
+
+    target: dict[str, Any] | None = None
+    for task in tasks:
+        if str(task.get("project_id") or "") == project_id and str(task.get("segment_id") or "") == segment_id:
+            target = task
+            break
+    if not target:
+        raise ValueError("没有找到要重试的任务。")
+
+    if str(target.get("status") or "") == "success":
+        raise ValueError("任务已经成功，不需要重试。")
+    if str(target.get("status") or "") == "running":
+        raise ValueError("任务正在运行，不能重试。")
+
+    target["status"] = "pending"
+    target["submit_id"] = None
+    target["gen_status"] = None
+    target["fail_reason"] = None
+    target["finished_at"] = None
+    target["submit_stdout"] = None
+    target["submit_stderr"] = None
+    target["final_stdout"] = None
+    target["final_stderr"] = None
+    target["urls"] = []
+    target["download_dir"] = str(project_segment_output_dir(project_id, str(target.get("segment_name") or ""), segment_id))
+    target["manual_retry_requested_at"] = now_iso()
+    target["retry_count"] = int(target.get("retry_count") or 0) + 1
+    if not str(target.get("command") or "").strip():
+        target["command"] = command_from_queue_segment({
+            "command": target.get("command"),
+            "prompt": target.get("prompt"),
+            "images": target.get("images") or [],
+            "videos": target.get("videos") or [],
+            "audios": target.get("audios") or [],
+            "transition_prompts": target.get("transition_prompts") or [],
+            "duration": target.get("duration"),
+            "ratio": target.get("ratio"),
+            "model_version": target.get("model_version"),
+        })
+
+    pending = [
+        task for task in tasks
+        if task is not target
+        and str(task.get("status") or "") not in {"success", "failed", "fail", "rejected", "banned", "error", "cancelled"}
+    ]
+    completed = [task for task in tasks if task is not target and task not in pending]
+    next_tasks = pending + [target] + completed
+    for index, task in enumerate(next_tasks, start=1):
+        task["index"] = index
+    state["tasks"] = next_tasks
+    save_queue_state(state_file, state)
+    global_document = rebuild_global_queue_from_state(state_file, output_root, queue_file)
+    return {"task": target, "queued_count": len(global_document.get("segments") or [])}
+
+
 def start_queue(payload: dict[str, Any]) -> dict[str, Any]:
     with LOCK:
         current = read_runner_meta()
-        if current.get("running"):
-            raise RuntimeError("当前已经有队列在运行。")
-
         ui_config = load_ui_config()
         project_id = str(payload.get("project_id") or ui_config.get("active_project_id") or "").strip()
         active_project = set_active_project(project_id) if project_id else get_active_project(ui_config)
-        active_queue_file = project_queue_file(active_project["id"]).expanduser().resolve()
-        queue_file = GLOBAL_QUEUE_FILE.expanduser().resolve()
         output_root = Path(payload.get("output_root") or ui_config.get("output_root") or DEFAULT_OUTPUT_ROOT).expanduser().resolve()
-        state_file = Path(payload.get("state_file") or ui_config.get("state_file") or output_root / "queue-state.json").expanduser().resolve()
+        state_file = normalize_state_file_path(payload.get("state_file") or ui_config.get("state_file"))
         requested_dreamina = str(payload.get("dreamina") or ui_config.get("dreamina") or "").strip()
         dreamina = requested_dreamina or detect_dreamina_path() or "dreamina"
         queue_content = payload.get("queue_content", "")
@@ -1231,20 +1446,35 @@ def start_queue(payload: dict[str, Any]) -> dict[str, Any]:
         resume = bool_value(payload.get("resume") if payload.get("resume") is not None else ui_config.get("resume"))
         stop_on_failure = bool_value(payload.get("stop_on_failure") if payload.get("stop_on_failure") is not None else ui_config.get("stop_on_failure"))
 
+        if current.get("running"):
+            running_queue_file = Path(current.get("queue_file") or GLOBAL_QUEUE_FILE).expanduser().resolve()
+            running_output_root = Path(current.get("output_root") or output_root).expanduser().resolve()
+            running_state_file = normalize_state_file_path(current.get("state_file") or state_file)
+            global_document = write_active_and_global_queue(
+                active_project,
+                queue_content,
+                running_queue_file,
+                running_output_root,
+                running_state_file,
+            )
+            added_count = append_pending_tasks_to_state(global_document, running_state_file, running_output_root)
+            current["queued_updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            current["queued_count"] = len(global_document.get("segments") or [])
+            current["queued_added_count"] = added_count
+            current["queued_while_running"] = True
+            current["active_project_id"] = active_project["id"]
+            current["active_project_name"] = active_project["name"]
+            save_json(RUNNER_META_FILE, current)
+            return current
+
+        queue_file = GLOBAL_QUEUE_FILE.expanduser().resolve()
+
         # 校验 dreamina 路径
         import shutil
         if not shutil.which(dreamina) and not Path(dreamina).is_file():
             raise ValueError(f"dreamina 命令不存在: {dreamina}\n请在「队列配置」中填写正确的可执行文件路径")
 
-        ensure_dir(queue_file.parent)
-        ensure_dir(output_root)
-        ensure_dir(APP_DIR)
-        active_queue_file.write_text(queue_document_to_text(parse_queue_document(queue_content)), encoding="utf-8")
-        previous_state = load_json(state_file, {})
-        global_document = compose_global_queue_document(previous_state, output_root)
-        if not global_document.get("segments"):
-            raise ValueError("所有项目里都没有待执行任务。")
-        queue_file.write_text(queue_document_to_text(global_document), encoding="utf-8")
+        write_active_and_global_queue(active_project, queue_content, queue_file, output_root, state_file)
 
         if dreamina == "dreamina":
             resolved = shutil.which("dreamina")
@@ -1315,6 +1545,7 @@ def start_queue(payload: dict[str, Any]) -> dict[str, Any]:
             "active_project_name": active_project["name"],
             "command": command,
             "log_file": str(RUNNER_LOG_FILE),
+            "queued_while_running": False,
         }
         save_json(RUNNER_META_FILE, meta)
         return meta
@@ -1642,6 +1873,43 @@ HTML = """<!doctype html>
       font-family: var(--mono);
       white-space: pre-wrap;
       word-break: break-word;
+    }
+    .table-section {
+      margin-bottom: 16px;
+    }
+    .table-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 8px;
+    }
+    .table-head label {
+      margin: 0;
+    }
+    .table-scroll {
+      max-height: 360px;
+      overflow: auto;
+      background: #fff;
+      border: 1px solid rgba(216,207,191,0.7);
+      border-radius: 14px;
+    }
+    .table-scroll.completed {
+      max-height: 280px;
+    }
+    .table-section:fullscreen {
+      background: var(--bg);
+      padding: 24px;
+      overflow: hidden;
+    }
+    .table-section:fullscreen .table-scroll {
+      max-height: calc(100vh - 96px);
+      height: calc(100vh - 96px);
+    }
+    .fullscreen-table-btn {
+      padding: 8px 12px;
+      font-size: 12px;
+      white-space: nowrap;
     }
     pre {
       margin: 0;
@@ -2329,9 +2597,12 @@ HTML = """<!doctype html>
             </div>
           </div>
 
-          <div style="margin-bottom:16px;">
-            <label>待执行 / 执行中</label>
-            <div style="max-height:360px; overflow:auto;">
+          <div class="table-section" id="pendingTableSection">
+            <div class="table-head">
+              <label>待执行 / 执行中</label>
+              <button class="ghost fullscreen-table-btn" type="button" data-fullscreen-target="pendingTableSection">全屏</button>
+            </div>
+            <div class="table-scroll">
               <table>
                 <thead>
                   <tr>
@@ -2341,6 +2612,7 @@ HTML = """<!doctype html>
                     <th>状态</th>
                     <th>submit_id</th>
                     <th>命令</th>
+                    <th>操作</th>
                   </tr>
                 </thead>
                 <tbody id="taskTable"></tbody>
@@ -2348,9 +2620,12 @@ HTML = """<!doctype html>
             </div>
           </div>
 
-          <div style="margin-bottom:16px;">
-            <label>已完成</label>
-            <div style="max-height:280px; overflow:auto;">
+          <div class="table-section" id="completedTableSection">
+            <div class="table-head">
+              <label>已完成</label>
+              <button class="ghost fullscreen-table-btn" type="button" data-fullscreen-target="completedTableSection">全屏</button>
+            </div>
+            <div class="table-scroll completed">
               <table>
                 <thead>
                   <tr>
@@ -2360,6 +2635,7 @@ HTML = """<!doctype html>
                     <th>状态</th>
                     <th>submit_id</th>
                     <th>命令</th>
+                    <th>操作</th>
                   </tr>
                 </thead>
                 <tbody id="completedTaskTable"></tbody>
@@ -2489,6 +2765,9 @@ HTML = """<!doctype html>
           }
 
           const failReason = task.fail_reason ? `<div class="hint" style="color:var(--danger);margin-top:4px;">${escapeHtml(task.fail_reason)}</div>` : "";
+          const retryAction = (task.fail_reason || ["failed", "fail", "rejected", "banned", "error", "cancelled"].includes(task.status))
+            ? `<button class="ghost retry-task-btn" data-project-id="${escapeHtml(task.project_id || "")}" data-segment-id="${escapeHtml(task.segment_id || "")}">重试并加入队尾</button>`
+            : "";
           tr.innerHTML = `
             <td>${task.index}</td>
             <td>${escapeHtml(task.project_name || "-")}</td>
@@ -2499,6 +2778,7 @@ HTML = """<!doctype html>
             </td>
             <td><code>${escapeHtml(task.submit_id || "-")}</code></td>
             <td><code>${escapeHtml(task.command || "")}</code></td>
+            <td>${retryAction}</td>
           `;
           target.appendChild(tr);
         }
@@ -2509,15 +2789,45 @@ HTML = """<!doctype html>
 
       if (!pendingTasks.length) {
         const tr = document.createElement("tr");
-        tr.innerHTML = `<td colspan="6" class="hint">当前没有待执行任务</td>`;
+        tr.innerHTML = `<td colspan="7" class="hint">当前没有待执行任务</td>`;
         pendingBody.appendChild(tr);
       }
 
       if (!completedTasks.length) {
         const tr = document.createElement("tr");
-        tr.innerHTML = `<td colspan="6" class="hint">当前还没有已完成任务</td>`;
+        tr.innerHTML = `<td colspan="7" class="hint">当前还没有已完成任务</td>`;
         completedBody.appendChild(tr);
       }
+    }
+
+    async function retryTask(projectId, segmentId) {
+      if (!projectId || !segmentId) {
+        throw new Error("缺少任务标识，无法重试。");
+      }
+      if (!confirm("把这条失败任务重新加入它原项目的待执行队列队尾吗？")) return;
+      const data = await api("/api/retry_task", {
+        method: "POST",
+        body: JSON.stringify({ project_id: projectId, segment_id: segmentId })
+      });
+      await refresh();
+      alert(`已加入原项目待执行队列，当前待执行任务 ${data.queued_count || 0} 个。`);
+    }
+
+    async function toggleTableFullscreen(sectionId) {
+      const section = $(sectionId);
+      if (!section) return;
+      if (document.fullscreenElement === section) {
+        await document.exitFullscreen();
+        return;
+      }
+      await section.requestFullscreen();
+    }
+
+    function updateFullscreenButtons() {
+      document.querySelectorAll(".fullscreen-table-btn").forEach((button) => {
+        const target = button.dataset.fullscreenTarget;
+        button.textContent = document.fullscreenElement?.id === target ? "退出全屏" : "全屏";
+      });
     }
 
     function collectPayload() {
@@ -2590,7 +2900,7 @@ HTML = """<!doctype html>
       $("failCount").textContent = failCount;
       $("updatedAt").textContent = `最后刷新：${new Date().toLocaleString()}`;
       $("runnerPid").textContent = runner.pid || "-";
-      $("runnerOutput").textContent = data.output_root || "-";
+      $("runnerOutput").textContent = data.video_output_root || data.output_root || "-";
 
       const running = !!runner.running;
       $("runnerBadge").textContent = running ? "队列运行中" : "当前空闲";
@@ -3770,11 +4080,23 @@ HTML = """<!doctype html>
 
     async function startQueue() {
       syncQueueContentFromList();
-      await api("/api/start", {
+      const data = await api("/api/start", {
         method: "POST",
         body: JSON.stringify(collectPayload())
       });
       await refresh();
+      const runner = data.runner || {};
+      if (runner.queued_while_running) {
+        const added = Number(runner.queued_added_count || 0);
+        const count = Number(runner.queued_count || 0);
+        if (added > 0) {
+          alert(`已加入待执行队列，新增 ${added} 个任务，当前待执行任务 ${count} 个。`);
+        } else {
+          alert("队列已保存，但没有新增待执行任务。");
+        }
+      } else {
+        alert("队列已启动。");
+      }
     }
 
     async function stopQueue() {
@@ -3816,6 +4138,17 @@ HTML = """<!doctype html>
     $("startBtn").addEventListener("click", () => startQueue().catch(err => alert(err.message)));
     $("stopBtn").addEventListener("click", () => stopQueue().catch(err => alert(err.message)));
     $("refreshBtn").addEventListener("click", () => refresh().catch(err => alert(err.message)));
+    document.addEventListener("click", (event) => {
+      const button = event.target?.closest?.(".retry-task-btn");
+      if (!button) return;
+      retryTask(button.dataset.projectId, button.dataset.segmentId).catch(err => alert(err.message));
+    });
+    document.addEventListener("click", (event) => {
+      const button = event.target?.closest?.(".fullscreen-table-btn");
+      if (!button) return;
+      toggleTableFullscreen(button.dataset.fullscreenTarget).catch(err => alert(err.message));
+    });
+    document.addEventListener("fullscreenchange", updateFullscreenButtons);
     $("uploadImagesBtn").addEventListener("click", () => uploadFiles("image", "uploadImages", "mmImages").catch(err => alert(err.message)));
     $("uploadVideosBtn").addEventListener("click", () => uploadFiles("video", "uploadVideos", "mmVideos").catch(err => alert(err.message)));
     $("uploadAudiosBtn").addEventListener("click", () => uploadFiles("audio", "uploadAudios", "mmAudios").catch(err => alert(err.message)));
@@ -4026,21 +4359,6 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path in {"/", "/text2video"}:
             self._send_html(HTML)
             return
-        if parsed.path == "/douyin":
-            html_file = Path(__file__).parent / ".webui" / "douyin_collector.html"
-            if html_file.exists():
-                self._send_html(html_file.read_text(encoding="utf-8"))
-            else:
-                self._send_json({"error": "抖音采集页面不存在"}, status=404)
-            return
-        if parsed.path == "/api/douyin/accounts":
-            accounts = load_douyin_accounts()
-            self._send_json({"ok": True, "accounts": accounts})
-            return
-        if parsed.path == "/api/douyin/status":
-            status = get_douyin_task_status()
-            self._send_json({"ok": True, **status})
-            return
         if parsed.path == "/api/status":
             self._send_json(build_status_payload())
             return
@@ -4113,6 +4431,10 @@ class Handler(BaseHTTPRequestHandler):
                 meta = start_queue(payload)
                 self._send_json({"ok": True, "runner": meta})
                 return
+            if parsed.path == "/api/retry_task":
+                result = retry_task(payload)
+                self._send_json({"ok": True, **result})
+                return
             if parsed.path == "/api/save_config":
                 config = persist_runtime_form(payload)
                 self._send_json({"ok": True, "config": config})
@@ -4138,22 +4460,10 @@ class Handler(BaseHTTPRequestHandler):
                 active_project = set_active_project(project_id) if project_id else get_active_project()
                 queue_file = project_queue_file(active_project["id"]).expanduser().resolve()
                 ensure_dir(queue_file.parent)
-                normalized = queue_document_to_text(parse_queue_document(str(payload.get("queue_content", ""))))
+                document = merge_existing_segment_status(active_project["id"], parse_queue_document(str(payload.get("queue_content", ""))))
+                normalized = queue_document_to_text(document)
                 queue_file.write_text(normalized, encoding="utf-8")
                 self._send_json({"ok": True, "queue_file": str(queue_file), "project": active_project})
-                return
-            if parsed.path == "/api/douyin/accounts/save":
-                accounts = payload.get("accounts", [])
-                save_douyin_accounts(accounts)
-                self._send_json({"ok": True, "accounts": accounts})
-                return
-            if parsed.path == "/api/douyin/start":
-                result = start_douyin_task(payload)
-                self._send_json({"ok": True, **result})
-                return
-            if parsed.path == "/api/douyin/stop":
-                result = stop_douyin_task()
-                self._send_json({"ok": True, **result})
                 return
             self._send_json({"error": "Not Found"}, status=404)
         except Exception as exc:

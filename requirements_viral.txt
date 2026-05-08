@@ -4,6 +4,7 @@
 anthropic>=0.40.0
 chromadb>=0.5.0
 sentence-transformers>=3.0.0
+gradio>=4.44.0
 
 # 音频转录（二选一）
 openai-whisper>=20231117      # 本地 Whisper（精度高，需要 GPU）
