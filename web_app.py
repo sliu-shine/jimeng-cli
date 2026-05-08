@@ -487,11 +487,13 @@ def clear_stale_running_tasks(state_file: Path, state: dict[str, Any], runner: d
             continue
         submit_id = str(task.get("submit_id") or "").strip()
         if submit_id:
-            # A submitted task can still finish remotely after the local runner
-            # stops. Keep it resumable so the next runner can query/download it
-            # instead of duplicating the submission.
+            task["status"] = "paused"
             task["gen_status"] = task.get("gen_status") or "processing"
-            task["fail_reason"] = None
+            task["fail_reason"] = (
+                "runner 已停止；该任务已有 submit_id，未继续本地轮询。"
+                "再次启动队列会用这个 submit_id 继续查询/下载，不会重复提交。"
+            )
+            task["finished_at"] = task.get("finished_at") or stopped_at
             changed = True
             continue
         task["status"] = "failed"
@@ -1564,6 +1566,55 @@ def stop_queue() -> dict[str, Any]:
         return meta
 
 
+def clear_execution_queue() -> dict[str, Any]:
+    with LOCK:
+        meta = read_runner_meta()
+        pid = meta.get("pid")
+        stopped_runner = False
+        if isinstance(pid, int) and pid > 0 and meta.get("running"):
+            try:
+                os.killpg(pid, signal.SIGTERM)
+                stopped_runner = True
+            except ProcessLookupError:
+                stopped_runner = False
+            meta["running"] = False
+            meta["finished_at"] = now_iso()
+            meta["cleared_at"] = now_iso()
+            save_json(RUNNER_META_FILE, meta)
+
+        ui_config = load_ui_config()
+        output_root = Path(meta.get("output_root") or ui_config.get("output_root") or DEFAULT_OUTPUT_ROOT).expanduser().resolve()
+        state_file = normalize_state_file_path(meta.get("state_file") or ui_config.get("state_file"))
+        queue_file = Path(meta.get("queue_file") or GLOBAL_QUEUE_FILE).expanduser().resolve()
+
+        empty_queue = {"version": 1, "segments": []}
+        ensure_dir(queue_file.parent)
+        queue_file.write_text(json.dumps(empty_queue, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        empty_state = {
+            "created_at": now_iso(),
+            "updated_at": now_iso(),
+            "dreamina": meta.get("dreamina") or ui_config.get("dreamina") or "",
+            "queue_file": str(queue_file),
+            "output_root": str(output_root),
+            "state_file": str(state_file),
+            "poll_interval_seconds": int(ui_config.get("poll_interval") or 30),
+            "timeout_seconds": int(ui_config.get("timeout_seconds") or 10800),
+            "stop_on_failure": bool(ui_config.get("stop_on_failure")),
+            "tasks": [],
+        }
+        ensure_dir(state_file.parent)
+        state_file.write_text(json.dumps(empty_state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        return {
+            "cleared": True,
+            "stopped_runner": stopped_runner,
+            "queue_file": str(queue_file),
+            "state_file": str(state_file),
+            "runner": meta,
+        }
+
+
 HTML = """<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -2376,6 +2427,7 @@ HTML = """<!doctype html>
             <button class="ghost" id="saveBtn">保存队列</button>
             <button class="primary" id="startBtn">启动队列</button>
             <button class="danger" id="stopBtn">停止队列</button>
+            <button class="danger" id="clearExecutionQueueBtn">清空执行队列</button>
           </div>
         </div>
         <div class="panel-body">
@@ -4107,6 +4159,16 @@ HTML = """<!doctype html>
       await refresh();
     }
 
+    async function clearExecutionQueue() {
+      if (!confirm("确认清空执行队列吗？\\n\\n会停止当前本地 runner，并清空 .webui/global.queue.json 和 .webui/queue-state.json。\\n不会清空任何项目里的 queue.json，也不会删除已下载视频。")) return;
+      const data = await api("/api/clear_execution_queue", {
+        method: "POST",
+        body: JSON.stringify({})
+      });
+      await refresh();
+      alert(data.stopped_runner ? "已停止 runner，并清空执行队列。" : "已清空执行队列。");
+    }
+
     async function detectDreamina() {
       const data = await api("/api/status");
       if (!data.detected_dreamina) {
@@ -4137,6 +4199,7 @@ HTML = """<!doctype html>
     $("saveBtn").addEventListener("click", () => saveQueue().catch(err => alert(err.message)));
     $("startBtn").addEventListener("click", () => startQueue().catch(err => alert(err.message)));
     $("stopBtn").addEventListener("click", () => stopQueue().catch(err => alert(err.message)));
+    $("clearExecutionQueueBtn").addEventListener("click", () => clearExecutionQueue().catch(err => alert(err.message)));
     $("refreshBtn").addEventListener("click", () => refresh().catch(err => alert(err.message)));
     document.addEventListener("click", (event) => {
       const button = event.target?.closest?.(".retry-task-btn");
@@ -4454,6 +4517,10 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/api/stop":
                 meta = stop_queue()
                 self._send_json({"ok": True, "runner": meta})
+                return
+            if parsed.path == "/api/clear_execution_queue":
+                result = clear_execution_queue()
+                self._send_json({"ok": True, **result})
                 return
             if parsed.path == "/api/save_queue":
                 project_id = str(payload.get("project_id") or load_ui_config().get("active_project_id") or "").strip()

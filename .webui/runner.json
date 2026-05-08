@@ -1,13 +1,13 @@
 {
-  "pid": 83516,
+  "pid": 75974,
   "running": false,
   "started_at": null,
   "queue_file": "/Users/sliu/web-project/rich-projects/jimeng-cli/.webui/global.queue.json",
   "output_root": "/Users/sliu/web-project/rich-projects/jimeng-cli/web-output",
   "state_file": "/Users/sliu/web-project/rich-projects/jimeng-cli/.webui/queue-state.json",
   "dreamina": "/Users/sliu/.local/bin/dreamina",
-  "active_project_id": "project-f78027f9c6",
-  "active_project_name": "你家狗是不是经常干一些让你怀疑它智商的事儿【版本2 - 痛点型+拟人共情型】",
+  "active_project_id": "project-096dd57a9e",
+  "active_project_name": "你知道女生晚上遇到危险，什么狗才真的靠谱【版本1 - 痛点型+恐惧型】",
   "command": [
     "/opt/miniconda3/bin/python",
     "/Users/sliu/web-project/rich-projects/jimeng-cli/dreamina_queue.py",
@@ -25,5 +25,6 @@
     "10800"
   ],
   "log_file": "/Users/sliu/web-project/rich-projects/jimeng-cli/.webui/runner.log",
-  "queued_while_running": false
+  "queued_while_running": false,
+  "finished_at": "2026-05-08T16:58:36+0800"
 }

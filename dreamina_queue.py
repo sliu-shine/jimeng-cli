@@ -763,6 +763,8 @@ def task_retry_requested(task: dict[str, Any]) -> bool:
 def merge_task_record(existing: dict[str, Any], incoming: dict[str, Any]) -> None:
     existing_status = str(existing.get("status") or "").lower()
     incoming_status = str(incoming.get("status") or "").lower()
+    if existing.get("fail_reason") and not incoming.get("fail_reason"):
+        incoming = {**incoming, "fail_reason": existing.get("fail_reason")}
     if task_retry_requested(incoming):
         existing.update(incoming)
         return
@@ -988,6 +990,11 @@ def command_failure_reason(result: CommandResult, stage: str) -> str:
     )
 
 
+def should_stop_queue_for_failure(fail_reason: str | None) -> bool:
+    text = str(fail_reason or "").lower()
+    return "exceedconcurrencylimit" in text or "ret=1310" in text
+
+
 def persist_command_logs(base_dir: Path, prefix: str, result: CommandResult) -> None:
     ensure_dir(base_dir)
     write_text(base_dir / f"{prefix}.stdout.log", result.stdout)
@@ -1154,7 +1161,7 @@ def execute_task_attempt(
             "status": status_from_polled_result(parsed_submit),
             "submit_id": submit_id,
             "gen_status": status or "processing",
-            "fail_reason": None,
+            "fail_reason": parsed_submit.get("fail_reason"),
             "submit_stdout": attempt["submit_stdout"],
             "submit_stderr": attempt["submit_stderr"],
             "started_at": task.get("started_at") or now_iso(),
@@ -1325,7 +1332,7 @@ def run_queue(args: argparse.Namespace) -> int:
             task_index += 1
             append_new_tasks_from_queue(args, state, state_path)
             continue
-        if task["status"] == "running":
+        if task["status"] in {"running", "paused"}:
             submit_id = str(task.get("submit_id") or "").strip()
             if submit_id:
                 label = task["label"]
@@ -1341,6 +1348,9 @@ def run_queue(args: argparse.Namespace) -> int:
                     append_new_tasks_from_queue(args, state, state_path)
                     continue
                 log(f"任务 #{task['index']} 续跑失败，submit_id={submit_id}，原因: {task.get('fail_reason') or '-'}")
+                if should_stop_queue_for_failure(task.get("fail_reason")):
+                    log("检测到平台并发限制，已停止继续提交，剩余 pending 任务保留在队列中。")
+                    return 1
                 if args.stop_on_failure:
                     return 1
                 task_index += 1
@@ -1392,6 +1402,9 @@ def run_queue(args: argparse.Namespace) -> int:
             continue
 
         log(f"任务 #{task['index']} 失败，submit_id={task.get('submit_id') or '-'}，原因: {task.get('fail_reason') or '-'}")
+        if should_stop_queue_for_failure(task.get("fail_reason")):
+            log("检测到平台并发限制，已停止继续提交，剩余 pending 任务保留在队列中。")
+            return 1
         if args.stop_on_failure:
             return 1
         task_index += 1

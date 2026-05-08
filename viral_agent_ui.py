@@ -24,6 +24,7 @@ from viral_agent.analyzer import _call_claude, analyze_script, engagement_level
 from viral_agent.agent import format_generation_report, generate_detailed
 from viral_agent.ai_providers import apply_provider, get_provider, masked_key, provider_choices
 from viral_agent.seedance_prompt_builder import build_seedance_outputs, get_channel_choices, get_default_channel_id
+from viral_agent.sora_prompt_builder import build_sora_outputs
 from douyin.douyin_downloader.pipeline import DouyinViralPipeline
 from douyin.douyin_downloader.transcriber import extract_transcript
 from scripts.claude_client import ClaudeClient
@@ -562,6 +563,38 @@ def split_script_into_segments(script: str, max_seconds: int = 15) -> list[dict]
 
 def build_dreamina_prompts(script: str, max_seconds: int, model_version: str, channel_id: str):
     return build_seedance_outputs(script, model_version=model_version or "seedance2.0fast", channel_id=channel_id or None)
+
+
+def build_sora_prompts(script: str):
+    """构建 Sora 提示词"""
+    return build_sora_outputs(script)
+
+
+def save_sora_queue_to_file(queue_json: str, file_path: str) -> str:
+    """保存 Sora 队列到文件"""
+    if not queue_json or not queue_json.strip():
+        return "❌ 队列 JSON 为空，请先点击「拆分为 Sora 2.0 视频提示词」。"
+
+    if not file_path or not file_path.strip():
+        return "❌ 请输入保存路径。"
+
+    try:
+        # 验证 JSON 格式
+        json.loads(queue_json)
+
+        # 保存文件
+        output_path = Path(file_path.strip())
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(queue_json)
+
+        return f"✅ 队列已保存到: {output_path}\n\n执行命令：\n```bash\npython sora_queue.py {output_path}\n```"
+
+    except json.JSONDecodeError as e:
+        return f"❌ JSON 格式错误: {e}"
+    except Exception as e:
+        return f"❌ 保存失败: {e}"
 
 
 def refresh_project_choices():
@@ -2507,6 +2540,102 @@ with gr.Blocks(title="爆款文案智能体") as demo:
                     inputs=[dreamina_queue_json, seedance_new_project_name, saved_script_text],
                     outputs=[seedance_project_dropdown, seedance_import_status],
                 )
+
+        with gr.Tab("🎥 Sora 视频生成"):
+            gr.Markdown("""
+## Sora 2.0 视频生成（云雾 API）
+
+使用云雾 API 的 sora-2-all 模型生成高质量真实感视频。
+
+**特点：**
+- 真实感视频风格（与 Seedance 的动画风格不同）
+- 支持 5-20 秒视频片段
+- 电影级画面质感
+
+**使用前准备：**
+1. 设置环境变量 `YUNWU_API_KEY`（云雾 API 密钥）
+2. 可选设置 `YUNWU_BASE_URL`（默认：https://api.yunwu.ai）
+""")
+
+            with gr.Row():
+                with gr.Column(scale=2):
+                    sora_gen_saved_dropdown = gr.Dropdown(
+                        label="已保存的文案",
+                        choices=generated_script_choices(),
+                        interactive=True,
+                        scale=3,
+                    )
+                sora_refresh_saved_btn = gr.Button("刷新列表", scale=1)
+                sora_load_saved_btn = gr.Button("载入", variant="primary", scale=1)
+
+            sora_saved_status = gr.Markdown(value=f"已保存 {len(generated_script_choices())} 条文案。")
+            sora_script_text = gr.Textbox(
+                label="当前文案（可编辑）",
+                lines=10,
+                placeholder="生成或载入文案后，这里会出现可继续加工的文案。",
+            )
+
+            sora_split_btn = gr.Button("🎥 拆分为 Sora 2.0 视频提示词", variant="primary")
+
+            sora_prompts_output = gr.Markdown(label="Sora 2.0 提示词")
+            sora_queue_json = gr.Textbox(
+                label="Sora 队列 JSON（可保存后使用 sora_queue.py 执行）",
+                lines=8,
+            )
+
+            with gr.Row():
+                sora_save_queue_btn = gr.Button("💾 保存队列到文件", variant="secondary")
+                sora_queue_file_path = gr.Textbox(
+                    label="保存路径",
+                    placeholder="例如：/path/to/sora_queue.json",
+                    scale=3,
+                )
+            sora_save_status = gr.Markdown()
+
+            gr.Markdown("""
+### 执行队列
+
+保存队列文件后，在命令行执行：
+
+```bash
+python sora_queue.py /path/to/sora_queue.json
+```
+
+或指定输出目录：
+
+```bash
+python sora_queue.py /path/to/sora_queue.json --output-dir /path/to/outputs
+```
+""")
+
+            # 事件绑定
+            sora_refresh_saved_btn.click(
+                refresh_generated_scripts,
+                outputs=[sora_gen_saved_dropdown, sora_saved_status],
+            )
+            sora_load_saved_btn.click(
+                load_saved_generated_script,
+                inputs=[sora_gen_saved_dropdown],
+                outputs=[
+                    gr.Textbox(visible=False),  # gen_output placeholder
+                    sora_script_text,
+                    gr.Textbox(visible=False),  # topic_input placeholder
+                    gr.Textbox(visible=False),  # niche_input3 placeholder
+                    gr.Textbox(visible=False),  # req_input placeholder
+                    gr.Number(visible=False),   # versions_input placeholder
+                    sora_saved_status,
+                ],
+            )
+            sora_split_btn.click(
+                build_sora_prompts,
+                inputs=[sora_script_text],
+                outputs=[sora_prompts_output, sora_queue_json],
+            )
+            sora_save_queue_btn.click(
+                lambda queue_json, file_path: save_sora_queue_to_file(queue_json, file_path),
+                inputs=[sora_queue_json, sora_queue_file_path],
+                outputs=[sora_save_status],
+            )
 
             gen_btn.click(
                 run_generate,

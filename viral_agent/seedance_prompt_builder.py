@@ -16,18 +16,36 @@ from pathlib import Path
 from scripts.claude_client import ClaudeClient
 
 
+PROMPT_CONFIG_PATH = Path(__file__).parent / "prompts" / "seedance_profiles.json"
+
+
+def _load_prompt_config() -> dict:
+    if not PROMPT_CONFIG_PATH.exists():
+        return {}
+    try:
+        with open(PROMPT_CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+PROMPT_CONFIG = _load_prompt_config()
+
+
 # 默认画风模板（向后兼容）
 FIXED_STYLE_TEMPLATE = (
-    "温馨治愈日系二维手绘动画画风，吉卜力式温暖动画质感，宫崎骏动画电影般的柔和氛围，"
+    "温暖日系二维手绘动画风格，柔和电影感，自然水彩背景，治愈家庭氛围，"
     "非真实摄影，非写实视频，非3D，非半写实；画面为纯二维手绘动画质感，线条柔和流畅，"
     "无尖锐棱角，色彩饱和度适中偏暖，暖黄色与浅橙色自然柔光，画面干净通透，背景简洁耐看，"
-    "光影柔和，有温暖家庭陪伴感和轻电影感。核心主体为{subject_style}，"
-    "{pet_label}毛发蓬松柔软、根根分明，脸部表情拟人化但不过度夸张，眼睛大而明亮有神，动作自然，"
+    "光影柔和，有温暖家庭陪伴感。核心主体为{subject_style}，"
+    "{pet_label}毛发蓬松柔软、层次清楚，脸部表情拟人化但不过度夸张，眼睛明亮有神，动作自然，"
     "情绪灵动，造型可爱治愈，全程角色造型稳定统一。场景为生活化二维动画场景，可以是温暖客厅、"
     "卧室、沙发边、阳光草地、公园、家庭地板、窗边等，所有场景都保持同一套温暖日系手绘动画质感。"
-    "科普示意画面也必须保持同一治愈动画风格，微生物、DNA、大脑结构、多巴胺、气味粒子、情绪云团等"
-    "都要画成柔和、干净、温暖、易懂的动画化示意，不要冷冰冰科技风，不要真实医学图，不要恐怖微观画面。"
+    "科普示意画面只在分镜明确需要时出现，必须保持同一治愈动画风格，气味粒子、信任光圈、脆弱部位示意、"
+    "情绪云团等都要画成柔和、干净、温暖、易懂的动画化示意，不要冷冰冰科技风，不要真实医学图，不要恐怖微观画面。"
 )
+FIXED_STYLE_TEMPLATE = str(PROMPT_CONFIG.get("default_style_template") or FIXED_STYLE_TEMPLATE)
 
 
 def _load_channel_styles() -> dict:
@@ -64,21 +82,21 @@ def get_default_channel_id() -> str | None:
     config = _load_channel_styles()
     return config.get("default_channel")
 
-GLOBAL_QUALITY_REQUIREMENTS = (
+GLOBAL_QUALITY_REQUIREMENTS = str(PROMPT_CONFIG.get("global", {}).get("quality_requirements") or (
     "适配即梦 Seedance 2.0，全能参考入口文生视频模式，16:9 横屏，指令理解精准，"
     "画面风格全程稳定统一，角色造型细节全程一致无跳变，科普示意画面清晰易懂，"
     "无画面崩坏，无逻辑错误，无角色变形，无画风漂移。"
-)
+))
 
-NO_DIALOGUE_CONSTRAINTS = (
+NO_DIALOGUE_CONSTRAINTS = str(PROMPT_CONFIG.get("global", {}).get("no_dialogue_constraints") or (
     "画面内容按纯视觉设计，全程不要人声朗读、不要人物聊天声、不要口型讲话、不要宠物拟人说话；"
     "人物和猫狗通过表情、动作和画面氛围表达情绪，嘴巴保持自然闭合或呼吸状态。"
-)
+))
 
-GLOBAL_NEGATIVE_CONSTRAINTS = (
+GLOBAL_NEGATIVE_CONSTRAINTS = str(PROMPT_CONFIG.get("global", {}).get("negative_constraints") or (
     "屏幕上不要出现任何字幕、中文文字、英文文字、水印、logo、账号名、标题贴纸。"
     "不要真实摄影、不要写实真人脸部、不要3D建模感、不要水印、不要低清晰度画面。"
-)
+))
 
 
 CHANNEL_PROMPT_PROFILES = {
@@ -157,8 +175,27 @@ DEFAULT_PROMPT_PROFILE = {
 }
 
 
+def _profile_from_config(profile_id: str) -> dict:
+    profiles = PROMPT_CONFIG.get("profiles", {})
+    profile = profiles.get(profile_id) if isinstance(profiles, dict) else None
+    return profile if isinstance(profile, dict) else {}
+
+
+def _merge_profile(base: dict, override: dict) -> dict:
+    merged = dict(base)
+    for key, value in override.items():
+        if key == "shot_counts" and isinstance(value, list):
+            value = tuple(value)
+        merged[key] = value
+    return merged
+
+
 def _channel_profile(channel_id: str | None = None) -> dict:
-    return CHANNEL_PROMPT_PROFILES.get(str(channel_id or ""), DEFAULT_PROMPT_PROFILE)
+    base = CHANNEL_PROMPT_PROFILES.get(str(channel_id or ""), DEFAULT_PROMPT_PROFILE)
+    override = _profile_from_config(str(channel_id or "default"))
+    if not override and channel_id is None:
+        override = _profile_from_config("default")
+    return _merge_profile(base, override)
 
 
 BEHAVIOR_KEYWORDS = {
@@ -206,6 +243,162 @@ SCIENCE_KEYWORDS = {
     "嗅觉": "{pet_label}鼻尖微距特写，柔和气味粒子形成清晰路径",
     "听觉": "{pet_label}耳朵轻轻转动，空气中出现柔和声波线条",
 }
+
+
+VISUAL_EVENT_PATTERNS = [
+    {
+        "keywords": ["最奢侈", "不是吃多贵", "不是住多大", "毫无保留", "做自己"],
+        "main_action": "{pet_label}在主人面前自然放松地做自己，从闻嗅、摇尾到贴近，主人逐渐理解这份信任比物质更珍贵",
+        "emotion": "从误会到理解，温柔揭开信任主题",
+        "scene": "温暖客厅与家中细节，食盆、狗窝和主人身边的空地形成对比",
+        "visuals": [
+            "温暖客厅里，精致食盆和柔软狗窝只作为背景，{pet_label}真正停留在主人脚边",
+            "{pet_label}抬头看主人后自然摇尾，身体没有拘谨，像在确认可以安心做自己",
+            "主人原本看向食盆和房间，随后低头看见{pet_label}贴近自己，表情从疑惑变柔",
+            "{pet_label}把鼻尖轻轻碰到主人手背，耳朵放松，尾巴慢慢扫过地板",
+            "柔和信任光圈只在主人手和{pet_label}接触处轻轻出现，突出真正珍贵的是毫无保留的靠近"
+        ],
+    },
+    {
+        "keywords": ["刚被领养", "流浪狗", "空洞", "警惕", "小心翼翼"],
+        "main_action": "{pet_label}站在新家门口或角落，身体压低，耳朵后贴，眼神警惕又不安",
+        "emotion": "刚到新家的紧张、试探和不敢放松",
+        "scene": "新家玄关或客厅角落，旁边有干净食盆、旧毯子或打开的纸箱",
+        "visuals": [
+            "{pet_label}半个身体躲在门边或纸箱旁，耳朵后贴，眼神小心扫视房间",
+            "主人蹲在远处保持距离，手掌摊开放低，没有强行靠近",
+            "{pet_label}向前迈半步又停住，鼻尖轻轻嗅空气，尾巴低低垂着",
+            "暖光从门缝和窗边落进来，但{pet_label}仍贴着角落保持警惕"
+        ],
+    },
+    {
+        "keywords": ["给它食物", "看你的脸色", "叫它名字", "往后缩"],
+        "main_action": "{pet_label}面对食盆迟迟不敢吃，先抬眼观察主人表情，听见名字后身体本能后缩",
+        "emotion": "害怕做错、谨慎求生、让人心疼",
+        "scene": "温暖客厅地板上的食盆旁，主人蹲在一米外安静陪伴",
+        "visuals": [
+            "食盆放在地板中央，{pet_label}靠近又停下，爪子停在碗边",
+            "{pet_label}没有立刻低头吃，而是抬眼偷看主人脸色，耳朵轻轻后压",
+            "主人轻轻放低手，身体后退半步给它空间，表情温柔克制",
+            "{pet_label}听见被呼唤的动作暗示后肩膀一缩，身体往后挪到安全距离",
+            "最后{pet_label}小口靠近食盆，仍一边吃一边用余光看主人"
+        ],
+    },
+    {
+        "keywords": ["蜷成", "紧绷的球", "梦里", "不敢放松"],
+        "main_action": "{pet_label}睡觉时蜷成紧绷的小球，爪子收紧，耳朵在梦里也轻轻发抖",
+        "emotion": "疲惫、戒备、心疼和压抑的不安全感",
+        "scene": "夜晚卧室或客厅小毯子上，灯光很柔但空间安静",
+        "visuals": [
+            "{pet_label}蜷缩成很小的一团睡在毯子边缘，背部弓起，爪子紧紧收在胸前",
+            "微距特写里耳朵轻颤，眼皮在梦里不安地动，呼吸很浅",
+            "主人在远处停下脚步，没有打扰，只把柔软毯角轻轻拉近",
+            "画面用淡灰色小云团压在{pet_label}身边，随后被房间暖光轻轻稀释"
+        ],
+    },
+    {
+        "keywords": ["这种", "懂事", "心疼", "怕", "失去这个家"],
+        "main_action": "{pet_label}克制地坐在主人面前，不敢靠太近，眼神一直确认主人的反应",
+        "emotion": "心疼、理解和害怕再次失去家的脆弱感",
+        "scene": "安静客厅，主人坐在地板上和{pet_label}保持平视",
+        "visuals": [
+            "{pet_label}坐得很端正，尾巴贴着地面，像在努力不犯错",
+            "主人慢慢放下手中的东西，视线变柔，意识到它的紧绷不是乖巧而是害怕",
+            "{pet_label}抬头确认主人表情，眼睛湿润但没有夸张流泪",
+            "家的轮廓变成柔和暖光包围客厅，角落的灰色阴影慢慢变浅"
+        ],
+    },
+    {
+        "keywords": ["发疯", "狂奔", "撞了墙", "继续跑", "小疯子", "犯傻", "闹腾"],
+        "main_action": "{pet_label}在客厅突然撒欢狂奔，急刹转弯，轻轻撞到软垫或墙边后又开心继续跑",
+        "emotion": "被宠大的松弛、放肆、快乐和安全感",
+        "scene": "明亮客厅，沙发、地毯和软垫形成安全的奔跑路线",
+        "visuals": [
+            "{pet_label}从沙发边突然冲出，耳朵和毛发被速度带起，尾巴高高摆动",
+            "低机位跟拍{pet_label}在地毯上急刹转弯，爪子轻轻打滑但动作可爱自然",
+            "{pet_label}轻轻撞到软垫或墙边后愣一瞬，立刻甩甩头继续快乐奔跑",
+            "主人先惊讶后笑着让开路线，手里抱枕被风带起一点",
+            "全景里客厅被跑动轨迹带出柔和弧线，强调这是安全环境里的撒欢"
+        ],
+    },
+    {
+        "keywords": ["四脚朝天", "肚皮", "口水", "跨过去", "懒得动"],
+        "main_action": "{pet_label}四脚朝天睡在地板或地毯上，肚皮完全露出，嘴边有一点口水，主人从旁边跨过它也不动",
+        "emotion": "彻底信任、放松到毫无防备",
+        "scene": "午后客厅地毯或卧室地板，阳光落在{pet_label}肚皮和爪子上",
+        "visuals": [
+            "{pet_label}仰躺在地毯中央，四只爪子松松摊开，肚皮随着呼吸轻轻起伏",
+            "微距特写嘴边一点透明口水和放松的胡须，表情睡得很安心",
+            "主人抱着衣物从旁边小心跨过，{pet_label}只是耳朵动一下，完全懒得起身",
+            "柔和示意镜头用浅色光圈标出肚皮的脆弱位置，再自然回到现实画面",
+            "{pet_label}翻了半个身又继续露着肚皮睡，尾巴末端轻轻扫一下地毯"
+        ],
+    },
+    {
+        "keywords": ["沙发", "挤到你怀里", "专属沙发"],
+        "main_action": "{pet_label}硬挤进坐在沙发上的主人怀里，把主人当成柔软靠垫",
+        "emotion": "亲密、依赖、理直气壮的安心感",
+        "scene": "温暖客厅沙发上，主人坐着休息，旁边有毯子和抱枕",
+        "visuals": [
+            "主人刚坐到沙发上，{pet_label}从画面边缘挤进来，鼻尖顶开毯子",
+            "{pet_label}前爪搭上主人腿，身体一点点往怀里塞，动作笨拙又坚定",
+            "主人被挤得轻轻后仰，随后笑着调整坐姿给它让出位置",
+            "{pet_label}把下巴压在主人手臂上，眼睛半眯，像占到专属位置",
+            "全景里主人和{pet_label}挤在一起，沙发空间被它理直气壮占满"
+        ],
+    },
+    {
+        "keywords": ["犬类", "最致命", "绝对信任", "完全暴露"],
+        "main_action": "{pet_label}在主人面前慢慢翻身露出肚皮，身体完全松开，没有任何防备动作",
+        "emotion": "从脆弱到信任的温柔解释",
+        "scene": "客厅地毯上，现实互动与柔和信任示意自然衔接",
+        "visuals": [
+            "{pet_label}先侧躺看着主人，确认安全后慢慢翻成露肚皮姿势",
+            "柔和示意镜头里，{pet_label}的身体轮廓旁出现浅色保护光圈，肚皮位置用温暖线条轻轻标出",
+            "主人没有突然伸手，只把手停在旁边等待，给{pet_label}选择空间",
+            "{pet_label}主动用爪子轻碰主人手腕，眼神放松，尾巴轻轻扫地",
+            "画面回到现实，主人轻轻抚摸胸口旁边的毛发，{pet_label}安心闭眼"
+        ],
+    },
+    {
+        "keywords": ["笃定", "不会伤害", "整个生命", "真心"],
+        "main_action": "{pet_label}在主人身边自由奔跑、露肚皮、贴靠，所有放肆动作汇成对家的信任",
+        "emotion": "信任升华、被爱托住的安全感",
+        "scene": "家庭客厅到窗边的连续温暖空间，像回忆蒙太奇",
+        "visuals": [
+            "{pet_label}从客厅奔跑画面自然切到露肚皮睡觉画面，动作像回忆一样连贯",
+            "主人坐在窗边伸手，{pet_label}主动把头放进掌心，身体完全靠近",
+            "暖色信任光圈不是装饰性乱飞，而是沿着主人手掌和{pet_label}身体接触处轻轻扩散",
+            "画面短暂闪回曾经小心翼翼的角落，再回到现在明亮客厅里的放松姿态",
+            "{pet_label}抬头看主人后安心趴下，像确认这个家不会消失"
+        ],
+    },
+    {
+        "keywords": ["别嫌它烦", "摸摸它的头", "放心", "永远是你的"],
+        "main_action": "主人蹲下轻轻摸{pet_label}的头，{pet_label}从兴奋慢慢安静下来，把头贴进主人掌心",
+        "emotion": "安抚、承诺和家的归属感",
+        "scene": "傍晚客厅或门口暖光里，主人和{pet_label}平视相处",
+        "visuals": [
+            "{pet_label}还带着刚撒欢后的兴奋，小步围着主人转，尾巴轻快摇动",
+            "主人蹲下来伸手，动作缓慢稳定，轻轻摸过{pet_label}头顶和耳后",
+            "{pet_label}逐渐停下，眼睛变柔，把头主动贴进主人掌心",
+            "房间里的灯光像家的边界一样温柔包住一人一狗",
+            "收束在{pet_label}安心趴到主人脚边，尾巴末端轻轻动一下"
+        ],
+    },
+    {
+        "keywords": ["评论区", "神经病", "瞬间"],
+        "main_action": "主人拿着手机微笑看向{pet_label}，{pet_label}凑近镜头做出调皮小动作，形成无文字的互动邀请",
+        "emotion": "轻松、亲密、带一点调皮的收尾",
+        "scene": "温暖客厅沙发边或地毯上，手机屏幕不显示任何文字内容",
+        "visuals": [
+            "主人坐在地毯上拿着手机，屏幕朝外但没有任何可读文字，脸上露出回忆般的微笑",
+            "{pet_label}从旁边把脑袋凑过来，鼻尖几乎碰到手机边缘",
+            "{pet_label}忽然做出一个调皮姿势，比如歪头、趴到主人腿上或用爪子轻碰手机",
+            "主人放下手机摸摸它，画面停在一人一狗轻松贴在一起的温暖瞬间"
+        ],
+    },
+]
 
 
 @dataclass
@@ -257,6 +450,9 @@ def _render_template(text: str, pet_context: dict[str, str]) -> str:
 
 def get_style_template_for_channel(channel_id: str | None = None) -> str:
     """根据频道ID获取画风模板"""
+    config_style = _profile_from_config(str(channel_id or "default")).get("style_template")
+    if isinstance(config_style, str) and config_style.strip():
+        return config_style
     if not channel_id:
         return FIXED_STYLE_TEMPLATE
 
@@ -376,6 +572,32 @@ def analyze_keywords(text: str, pet_context: dict[str, str] | None = None) -> di
     }
 
 
+def _matched_visual_events(text: str, pet_context: dict[str, str]) -> list[dict]:
+    matched = []
+    for event in VISUAL_EVENT_PATTERNS:
+        keywords = event.get("keywords", [])
+        score = sum(1 for keyword in keywords if str(keyword) in text)
+        if score:
+            rendered = {}
+            for key, value in event.items():
+                if key == "keywords":
+                    continue
+                if isinstance(value, list):
+                    rendered[key] = [_render_template(str(item), pet_context) for item in value]
+                else:
+                    rendered[key] = _render_template(str(value), pet_context)
+            rendered["_score"] = score
+            rendered["_keyword_chars"] = sum(len(str(keyword)) for keyword in keywords if str(keyword) in text)
+            matched.append(rendered)
+    matched.sort(key=lambda item: (int(item.get("_score", 0)), int(item.get("_keyword_chars", 0))), reverse=True)
+    return matched
+
+
+def _first_visual_event(text: str, pet_context: dict[str, str]) -> dict | None:
+    events = _matched_visual_events(text, pet_context)
+    return events[0] if events else None
+
+
 def _segment_function(index: int, total: int, keywords: dict[str, list[str]], pet_context: dict[str, str], channel_id: str | None = None) -> str:
     pet_label = pet_context["pet_label"]
     if channel_id == "channel-science":
@@ -395,7 +617,11 @@ def _segment_function(index: int, total: int, keywords: dict[str, list[str]], pe
     return f"故事推进段，用{pet_label}行为和主人反应承接情绪共鸣"
 
 
-def _scene_for_segment(text: str, channel_id: str | None = None) -> str:
+def _scene_for_segment(text: str, channel_id: str | None = None, pet_context: dict[str, str] | None = None) -> str:
+    pet_context = pet_context or detect_pet_context(text)
+    event = _first_visual_event(text, pet_context)
+    if event and event.get("scene"):
+        return str(event["scene"])
     if any(word in text for word in ["睡", "床", "卧室"]):
         return "按本段内容自然选择的卧室或睡眠相关生活场景"
     if any(word in text for word in ["草地", "公园", "狼", "远古"]):
@@ -408,6 +634,9 @@ def _scene_for_segment(text: str, channel_id: str | None = None) -> str:
 
 
 def _main_action(text: str, keywords: dict[str, list[str]], pet_context: dict[str, str]) -> str:
+    event = _first_visual_event(text, pet_context)
+    if event and event.get("main_action"):
+        return str(event["main_action"])
     if keywords["behaviors"]:
         return keywords["behaviors"][0]
     pet_label = pet_context["pet_label"]
@@ -417,6 +646,9 @@ def _main_action(text: str, keywords: dict[str, list[str]], pet_context: dict[st
 
 
 def _main_emotion(text: str, keywords: dict[str, list[str]], pet_context: dict[str, str]) -> str:
+    event = _first_visual_event(text, pet_context)
+    if event and event.get("emotion"):
+        return str(event["emotion"])
     if keywords["emotions"]:
         return keywords["emotions"][0]
     if any(word in text for word in ["不是", "其实", "原来"]):
@@ -435,8 +667,13 @@ def _shot_count(duration: int, channel_id: str | None = None) -> int:
 
 def _shot_visuals(text: str, keywords: dict[str, list[str]], pet_context: dict[str, str], channel_id: str | None = None) -> list[str]:
     visuals = []
+    for event in _matched_visual_events(text, pet_context):
+        event_visuals = event.get("visuals")
+        if isinstance(event_visuals, list):
+            visuals.extend(str(item) for item in event_visuals if str(item).strip())
     visuals.extend(keywords["behaviors"])
-    visuals.extend(keywords["science"])
+    if keywords["science"] or any(word in text for word in ["犬类", "肚皮", "信任", "嗅觉", "气味", "大脑", "多巴胺"]):
+        visuals.extend(keywords["science"])
     visuals.extend(keywords["emotions"])
     if not visuals:
         pet_label = pet_context["pet_label"]
@@ -458,6 +695,7 @@ def _shot_visuals(text: str, keywords: dict[str, list[str]], pet_context: dict[s
 def build_storyboard(duration: int, text: str, keywords: dict[str, list[str]], pet_context: dict[str, str], channel_id: str | None = None) -> list[str]:
     count = _shot_count(duration, channel_id)
     visuals = _shot_visuals(text, keywords, pet_context, channel_id)
+    has_event_visuals = bool(_matched_visual_events(text, pet_context))
     shots = []
     ranges = []
     start = 0
@@ -473,7 +711,7 @@ def build_storyboard(duration: int, text: str, keywords: dict[str, list[str]], p
         visual = visuals[idx % len(visuals)]
         if channel_id == "channel-science" and idx == 0:
             visual = f"窗边强烈但柔和的日光照亮桌面，{visual}"
-        elif idx == 0 and "误会" not in visual:
+        elif idx == 0 and not has_event_visuals and "误会" not in visual:
             visual = f"主人先露出轻微疑惑，随后看见{visual}"
         if idx == len(ranges) - 1:
             if channel_id == "channel-science":
@@ -603,13 +841,14 @@ def _ai_split_prompt(transcript: str, pet_context: dict[str, str], channel_id: s
 1. 每段 duration 必须是 4-15 的整数，优先 15 秒，最后一段可以 4-14 秒，不要为了凑满 15 秒加无效画面。
 2. {profile['shot_guidance']}
 3. 每个分镜必须写清时间轴、景别、运镜、画面动作，分镜描述以可看见的画面为主；可以保留自然动作音效和环境音效，但不要设计人声内容。
-4. 必须主动识别输入文案里的猫狗行为关键词、情绪关键词、轻科普关键词，并安排对应画面。
+4. 必须主动识别输入文案里的猫狗行为关键词、情绪关键词、轻科普关键词，并安排对应画面；不要把不同段都写成“抬头、摸头、暖光光点”。
 5. {profile['science_guidance']}
 6. 主人不能抢戏，猫狗永远是核心主体；人物只能以当前频道画风表现，避免写实真人脸部。
 7. 不要输出固定画风、负面约束和质量词，这些由程序统一注入。
 8. 严禁在 function、main_action、emotion、scene、storyboard 中出现或暗示：字幕、文字贴片、人物开口、宠物开口、人声朗读、聊天、对白、台词、口播、配音、旁白、解说；允许出现脚步声、爪子踩地声、球落地声、布料摩擦声、轻微呼吸声、猫咪自然呼噜声、风声、草地声和室内环境声。
 9. 严禁在 storyboard 中写“对应……”“视觉重点……”“画面重点……”或复制输入文案原句；分镜只能写镜头中实际发生的可见动作和动画化示意。
-10. 只输出 JSON，不要 Markdown，不要解释。
+10. 情绪必须有转折：害怕/警惕的段落要画出身体压低、后缩、偷看、蜷缩；信任/撒欢的段落要画出奔跑、露肚皮、挤怀里、贴靠等具体动作。
+11. 只输出 JSON，不要 Markdown，不要解释。
 
 JSON 格式：
 {{
@@ -622,8 +861,8 @@ JSON 格式：
       "emotion": "本段核心情绪",
       "scene": "本段核心场景",
       "storyboard": [
-        "0-2秒：近景固定镜头，猫咪或狗狗在温暖室内自然抬头，主人手部轻轻停在旁边，画面安静柔和",
-        "2-4秒：微距特写镜头，镜头缓慢推近猫咪或狗狗的毛发，柔和的科普示意元素轻轻出现"
+        "0-2秒：近景固定镜头，刚到新家的狗狗半躲在门边，耳朵后贴，眼神小心扫视房间",
+        "2-4秒：低机位跟拍镜头，狗狗在客厅地毯上突然撒欢冲出，急刹转弯，尾巴高高摆动"
       ]
     }}
   ]
@@ -671,7 +910,7 @@ def _segments_from_ai_plan(plan: dict, transcript: str, pet_context: dict[str, s
             function=_sanitize_visual_text(str(raw.get("function") or _segment_function(index, len(raw_segments), keywords, pet_context, channel_id))),
             main_action=_sanitize_visual_text(str(raw.get("main_action") or _main_action(text, keywords, pet_context))),
             emotion=_sanitize_visual_text(str(raw.get("emotion") or _main_emotion(text, keywords, pet_context))),
-            scene=_sanitize_visual_text(str(raw.get("scene") or _scene_for_segment(text, channel_id))),
+            scene=_sanitize_visual_text(str(raw.get("scene") or _scene_for_segment(text, channel_id, pet_context))),
             storyboard=_sanitize_storyboard_items(storyboard),
             prompt="",
             source="ai",
@@ -696,7 +935,7 @@ def build_seedance_segments_rule(transcript: str, material_refs: dict[str, str] 
             function=_segment_function(idx, total, keywords, pet_context, channel_id),
             main_action=_main_action(text, keywords, pet_context),
             emotion=_main_emotion(text, keywords, pet_context),
-            scene=_scene_for_segment(text, channel_id),
+            scene=_scene_for_segment(text, channel_id, pet_context),
             storyboard=storyboard,
             prompt="",
         )
