@@ -82,6 +82,37 @@ def get_default_channel_id() -> str | None:
     config = _load_channel_styles()
     return config.get("default_channel")
 
+
+def get_channel_style(channel_id: str | None) -> str:
+    """
+    获取频道的视觉风格描述
+
+    Args:
+        channel_id: 频道ID
+
+    Returns:
+        视觉风格描述字符串
+    """
+    if not channel_id:
+        return "清晰日漫动画风格，16:9，电影级画面"
+
+    config = _load_channel_styles()
+    channels = config.get("channels", [])
+
+    for channel in channels:
+        if isinstance(channel, dict) and str(channel.get("id")) == str(channel_id):
+            style = channel.get("style_description", "")
+            if style:
+                return style
+            # 如果没有 style_description，尝试从 split_style 构建
+            split_style = channel.get("split_style", "")
+            if split_style:
+                return f"{split_style}，16:9，电影级画面"
+
+    # 如果找不到频道，返回默认风格
+    return "清晰日漫动画风格，16:9，电影级画面"
+
+
 GLOBAL_QUALITY_REQUIREMENTS = str(PROMPT_CONFIG.get("global", {}).get("quality_requirements") or (
     "适配即梦 Seedance 2.0，全能参考入口文生视频模式，16:9 横屏，指令理解精准，"
     "画面风格全程稳定统一，角色造型细节全程一致无跳变，科普示意画面清晰易懂，"
@@ -172,6 +203,20 @@ DEFAULT_PROMPT_PROFILE = {
         "中景轻微横移",
         "全景镜头，慢慢拉远",
     ],
+    "default_visuals": [
+        "{pet_label}抬头看向主人，眼睛明亮，轻轻眨眼",
+        "主人蹲下伸手轻摸{pet_label}头顶，表情逐渐放松",
+        "暖黄色光点在主人和{pet_label}之间缓慢扩散，空气变得柔软",
+    ],
+    "add_default_questioning_prefix": True,
+    "first_shot_hook_prefix": "先用结果前置制造悬念：主人明显愣住，画面立刻切到",
+    "ending_visual_suffix": "画面收束在主人与{pet_label}安静陪伴的温暖瞬间",
+    "default_emotion": "温馨、治愈、轻科普、被{pet_label}爱着的安心感",
+    "emotion_atmosphere": "温馨治愈、轻科普、{love_phrase}",
+    "hook_strategy": "开头优先用反常行为、误会反差、结果前置或强情绪表情制造停留，不要用安静铺垫。",
+    "first_3s_rule": "前3秒必须出现一个观众一眼能看懂的异常动作、强反差或悬念画面，并给出宠物或主人的即时反应。",
+    "retention_structure": "前3秒必须有明确视觉钩子，后续根据内容灵活安排反差、递进、解释和情绪回收；不要机械套固定时间段，每个镜头都要提供新的动作、信息或情绪变化。",
+    "density_rule": "避免纯氛围空镜；每个镜头至少承担一个功能：推进动作、制造反差、解释原因、放大情绪或完成转折。",
 }
 
 
@@ -190,12 +235,24 @@ def _merge_profile(base: dict, override: dict) -> dict:
     return merged
 
 
+def _channel_style_config(channel_id: str | None) -> dict:
+    if not channel_id:
+        return {}
+    config = _load_channel_styles()
+    channels = config.get("channels", [])
+    for channel in channels:
+        if isinstance(channel, dict) and str(channel.get("id", "")) == str(channel_id):
+            return channel
+    return {}
+
+
 def _channel_profile(channel_id: str | None = None) -> dict:
     base = CHANNEL_PROMPT_PROFILES.get(str(channel_id or ""), DEFAULT_PROMPT_PROFILE)
     override = _profile_from_config(str(channel_id or "default"))
     if not override and channel_id is None:
         override = _profile_from_config("default")
-    return _merge_profile(base, override)
+    merged = _merge_profile(base, override)
+    return _merge_profile(merged, _channel_style_config(channel_id))
 
 
 BEHAVIOR_KEYWORDS = {
@@ -448,6 +505,19 @@ def _render_template(text: str, pet_context: dict[str, str]) -> str:
     return text.format(**pet_context)
 
 
+def _render_profile_text(value: object, pet_context: dict[str, str], fallback: str = "") -> str:
+    text = str(value or fallback or "")
+    try:
+        return _render_template(text, pet_context)
+    except KeyError:
+        return text
+
+
+def _sentence(text: str) -> str:
+    clean = str(text or "").strip()
+    return clean if not clean or re.search(r"[。！？!?；;.]$", clean) else clean + "。"
+
+
 def get_style_template_for_channel(channel_id: str | None = None) -> str:
     """根据频道ID获取画风模板"""
     config_style = _profile_from_config(str(channel_id or "default")).get("style_template")
@@ -645,7 +715,7 @@ def _main_action(text: str, keywords: dict[str, list[str]], pet_context: dict[st
     return f"{pet_label}在温暖家庭场景中自然活动，靠近、闻嗅、抬头、贴贴"
 
 
-def _main_emotion(text: str, keywords: dict[str, list[str]], pet_context: dict[str, str]) -> str:
+def _main_emotion(text: str, keywords: dict[str, list[str]], pet_context: dict[str, str], channel_id: str | None = None) -> str:
     event = _first_visual_event(text, pet_context)
     if event and event.get("emotion"):
         return str(event["emotion"])
@@ -653,16 +723,35 @@ def _main_emotion(text: str, keywords: dict[str, list[str]], pet_context: dict[s
         return keywords["emotions"][0]
     if any(word in text for word in ["不是", "其实", "原来"]):
         return "从误会到理解的温柔释然"
-    return f"温馨、治愈、轻科普、被{pet_context['pet_label']}爱着的安心感"
+    profile = _channel_profile(channel_id)
+    return _render_profile_text(
+        profile.get("default_emotion"),
+        pet_context,
+        f"温馨、治愈、轻科普、被{pet_context['pet_label']}爱着的安心感",
+    )
 
 
-def _shot_count(duration: int, channel_id: str | None = None) -> int:
+def _shot_count(duration: int, channel_id: str | None = None, keywords: dict[str, list[str]] | None = None) -> int:
     short_count, medium_count, long_count = _channel_profile(channel_id)["shot_counts"]
     if duration <= 5:
-        return short_count
-    if duration <= 10:
-        return medium_count
-    return long_count
+        base = short_count
+    elif duration <= 10:
+        base = medium_count
+    else:
+        base = long_count
+
+    keywords = keywords or {"behaviors": [], "emotions": [], "science": []}
+    info_points = sum(len(keywords.get(key, [])) for key in ["behaviors", "emotions", "science"])
+    if info_points >= 4 and duration >= 8:
+        base += 1
+    if info_points >= 6 and duration >= 12:
+        base += 1
+    if info_points <= 1 and duration >= 8:
+        base -= 1
+
+    min_count = 2 if duration <= 5 else 3
+    max_count = max(min_count, min(9, duration))
+    return max(min_count, min(max_count, base))
 
 
 def _shot_visuals(text: str, keywords: dict[str, list[str]], pet_context: dict[str, str], channel_id: str | None = None) -> list[str]:
@@ -676,14 +765,12 @@ def _shot_visuals(text: str, keywords: dict[str, list[str]], pet_context: dict[s
         visuals.extend(keywords["science"])
     visuals.extend(keywords["emotions"])
     if not visuals:
-        pet_label = pet_context["pet_label"]
-        if channel_id == "channel-science":
-            visuals = [
-                f"{pet_label}安静趴在窗边书桌旁，轻轻眨眼或微微转头",
-                f"主人在纸张旁停下笔，手部动作很轻，阳光落在桌面和{pet_label}身上",
-                "玻璃花瓶、书本和纸张形成柔和前景遮挡，画面保持清透留白",
-            ]
-        else:
+        profile = _channel_profile(channel_id)
+        default_visuals = profile.get("default_visuals")
+        if isinstance(default_visuals, list) and default_visuals:
+            visuals = [_render_profile_text(item, pet_context) for item in default_visuals if str(item).strip()]
+        if not visuals:
+            pet_label = pet_context["pet_label"]
             visuals = [
                 f"{pet_label}抬头看向主人，眼睛明亮，轻轻眨眼",
                 f"主人蹲下伸手轻摸{pet_label}头顶，表情逐渐放松",
@@ -693,7 +780,7 @@ def _shot_visuals(text: str, keywords: dict[str, list[str]], pet_context: dict[s
 
 
 def build_storyboard(duration: int, text: str, keywords: dict[str, list[str]], pet_context: dict[str, str], channel_id: str | None = None) -> list[str]:
-    count = _shot_count(duration, channel_id)
+    count = _shot_count(duration, channel_id, keywords)
     visuals = _shot_visuals(text, keywords, pet_context, channel_id)
     has_event_visuals = bool(_matched_visual_events(text, pet_context))
     shots = []
@@ -707,17 +794,21 @@ def build_storyboard(duration: int, text: str, keywords: dict[str, list[str]], p
             break
 
     shot_styles = _channel_profile(channel_id)["shot_styles"]
+    profile = _channel_profile(channel_id)
     for idx, (start, end) in enumerate(ranges):
         visual = visuals[idx % len(visuals)]
-        if channel_id == "channel-science" and idx == 0:
-            visual = f"窗边强烈但柔和的日光照亮桌面，{visual}"
-        elif idx == 0 and not has_event_visuals and "误会" not in visual:
+        first_prefix = _render_profile_text(profile.get("first_shot_prefix"), pet_context)
+        hook_prefix = _render_profile_text(profile.get("first_shot_hook_prefix"), pet_context)
+        if idx == 0 and hook_prefix and not has_event_visuals:
+            visual = f"{hook_prefix}{visual}"
+        elif idx == 0 and first_prefix:
+            visual = f"{first_prefix}{visual}"
+        elif idx == 0 and not has_event_visuals and profile.get("add_default_questioning_prefix", True) and "误会" not in visual:
             visual = f"主人先露出轻微疑惑，随后看见{visual}"
         if idx == len(ranges) - 1:
-            if channel_id == "channel-science":
-                visual = f"{visual}，画面像水彩插画一样缓慢呼吸，收束在主人与{pet_context['pet_label']}安静陪伴的明亮瞬间"
-            else:
-                visual = f"{visual}，画面收束在主人与{pet_context['pet_label']}安静陪伴的温暖瞬间"
+            ending_suffix = _render_profile_text(profile.get("ending_visual_suffix"), pet_context)
+            if ending_suffix:
+                visual = f"{visual}，{ending_suffix}"
         shots.append(f"{start}-{end}秒：{shot_styles[idx % len(shot_styles)]}，{visual}。")
     return shots
 
@@ -738,6 +829,29 @@ def _ensure_sentence_end(text: str) -> str:
     if not clean:
         return ""
     return clean if re.search(r"[。！？!?；;.]$", clean) else clean + "。"
+
+
+def _has_time_range(text: str) -> bool:
+    return bool(re.search(r"\d+(?:\.\d+)?\s*[-~—至到]\s*\d+(?:\.\d+)?\s*秒", str(text or "")))
+
+
+def _normalize_storyboard_timing(items: list[object], duration: int) -> list[str]:
+    clean_items = [str(item).strip() for item in items if str(item).strip()]
+    if not clean_items:
+        return []
+    if any(_has_time_range(item) for item in clean_items):
+        return clean_items
+
+    count = len(clean_items)
+    safe_duration = max(1, int(duration or count))
+    timed_items = []
+    for index, item in enumerate(clean_items):
+        start = min(safe_duration, index * 2)
+        end = safe_duration if index == count - 1 else min(safe_duration, start + 2)
+        start_text = str(int(start)) if float(start).is_integer() else str(start)
+        end_text = str(int(end)) if float(end).is_integer() else str(end)
+        timed_items.append(f"{start_text}-{end_text}秒：{item}")
+    return timed_items
 
 
 def _sanitize_storyboard_items(items: list[object]) -> list[str]:
@@ -817,25 +931,39 @@ def build_prompt_for_segment(
     channel_id: str | None = None,
 ) -> str:
     material_text = _material_instruction(material_refs)
-    storyboard_text = " ".join(_ensure_sentence_end(_sanitize_visual_text(item)) for item in segment.storyboard if str(item).strip())
+    storyboard_items = _normalize_storyboard_timing(segment.storyboard, segment.duration)
+    storyboard_text = " ".join(_ensure_sentence_end(_sanitize_visual_text(item)) for item in storyboard_items if str(item).strip())
     profile = _channel_profile(channel_id)
+    emotion_atmosphere = _render_profile_text(
+        profile.get("emotion_atmosphere"),
+        pet_context,
+        f"温馨治愈、轻科普、{pet_context['love_phrase']}",
+    )
     return (
         f"{NO_DIALOGUE_CONSTRAINTS}{fixed_style_for_pet(pet_context, channel_id)} 16:9 横屏。{material_text}"
         f"本段主场景：{_sanitize_visual_text(segment.scene)}。"
         f"本段{pet_context['pet_label']}和主人状态：{_join_visual_state(segment.main_action, segment.emotion)}。"
         f"本段按时间轴分镜：{storyboard_text} "
-        f"主情绪氛围：温馨治愈、轻科普、{pet_context['love_phrase']}。"
+        f"主情绪氛围：{emotion_atmosphere}。"
         f"{profile['motion']}{GLOBAL_QUALITY_REQUIREMENTS}{GLOBAL_NEGATIVE_CONSTRAINTS}"
     )
 
 
 def _ai_split_prompt(transcript: str, pet_context: dict[str, str], channel_id: str | None = None) -> str:
     profile = _channel_profile(channel_id)
+    hook_strategy = _render_profile_text(profile.get("hook_strategy"), pet_context)
+    first_3s_rule = _render_profile_text(profile.get("first_3s_rule"), pet_context)
+    retention_structure = _render_profile_text(profile.get("retention_structure"), pet_context)
+    density_rule = _render_profile_text(profile.get("density_rule"), pet_context)
     return f"""你是抖音猫狗治愈轻科普账号的纯视觉导演。请把输入文案拆成适配即梦 Seedance 2.0 的文生视频任务段，并输出严格 JSON。
 
 主体识别：{pet_context['pet_label']}
 目标风格：{profile['split_style']}。
 动态原则：{profile['motion']}
+爆款开头策略：{hook_strategy}
+前3秒视觉钩子：{first_3s_rule}
+留存节奏原则：{retention_structure}
+画面密度要求：{density_rule}
 
 硬性规则：
 1. 每段 duration 必须是 4-15 的整数，优先 15 秒，最后一段可以 4-14 秒，不要为了凑满 15 秒加无效画面。
@@ -844,11 +972,13 @@ def _ai_split_prompt(transcript: str, pet_context: dict[str, str], channel_id: s
 4. 必须主动识别输入文案里的猫狗行为关键词、情绪关键词、轻科普关键词，并安排对应画面；不要把不同段都写成“抬头、摸头、暖光光点”。
 5. {profile['science_guidance']}
 6. 主人不能抢戏，猫狗永远是核心主体；人物只能以当前频道画风表现，避免写实真人脸部。
-7. 不要输出固定画风、负面约束和质量词，这些由程序统一注入。
-8. 严禁在 function、main_action、emotion、scene、storyboard 中出现或暗示：字幕、文字贴片、人物开口、宠物开口、人声朗读、聊天、对白、台词、口播、配音、旁白、解说；允许出现脚步声、爪子踩地声、球落地声、布料摩擦声、轻微呼吸声、猫咪自然呼噜声、风声、草地声和室内环境声。
-9. 严禁在 storyboard 中写“对应……”“视觉重点……”“画面重点……”或复制输入文案原句；分镜只能写镜头中实际发生的可见动作和动画化示意。
-10. 情绪必须有转折：害怕/警惕的段落要画出身体压低、后缩、偷看、蜷缩；信任/撒欢的段落要画出奔跑、露肚皮、挤怀里、贴靠等具体动作。
-11. 只输出 JSON，不要 Markdown，不要解释。
+7. 第一段必须把最有停留价值的异常动作、反差结果或悬念画面提前到前3秒；后续段也要在开头快速给出本段信息点，不要慢铺垫。
+8. 不要机械套固定时间比例；根据内容灵活安排反差、递进、解释、情绪回收，但每个分镜都必须提供新动作、新信息或新情绪。
+9. 不要输出固定画风、负面约束和质量词，这些由程序统一注入。
+10. 严禁在 function、main_action、emotion、scene、storyboard 中出现或暗示：字幕、文字贴片、人物开口、宠物开口、人声朗读、聊天、对白、台词、口播、配音、旁白、解说；允许出现脚步声、爪子踩地声、球落地声、布料摩擦声、轻微呼吸声、猫咪自然呼噜声、风声、草地声和室内环境声。
+11. 严禁在 storyboard 中写“对应……”“视觉重点……”“画面重点……”或复制输入文案原句；分镜只能写镜头中实际发生的可见动作和动画化示意。
+12. 情绪必须有转折：害怕/警惕的段落要画出身体压低、后缩、偷看、蜷缩；信任/撒欢的段落要画出奔跑、露肚皮、挤怀里、贴靠等具体动作。
+13. 只输出 JSON，不要 Markdown，不要解释。
 
 JSON 格式：
 {{
@@ -909,7 +1039,7 @@ def _segments_from_ai_plan(plan: dict, transcript: str, pet_context: dict[str, s
             transcript=text,
             function=_sanitize_visual_text(str(raw.get("function") or _segment_function(index, len(raw_segments), keywords, pet_context, channel_id))),
             main_action=_sanitize_visual_text(str(raw.get("main_action") or _main_action(text, keywords, pet_context))),
-            emotion=_sanitize_visual_text(str(raw.get("emotion") or _main_emotion(text, keywords, pet_context))),
+            emotion=_sanitize_visual_text(str(raw.get("emotion") or _main_emotion(text, keywords, pet_context, channel_id))),
             scene=_sanitize_visual_text(str(raw.get("scene") or _scene_for_segment(text, channel_id, pet_context))),
             storyboard=_sanitize_storyboard_items(storyboard),
             prompt="",
@@ -934,7 +1064,7 @@ def build_seedance_segments_rule(transcript: str, material_refs: dict[str, str] 
             transcript=text,
             function=_segment_function(idx, total, keywords, pet_context, channel_id),
             main_action=_main_action(text, keywords, pet_context),
-            emotion=_main_emotion(text, keywords, pet_context),
+            emotion=_main_emotion(text, keywords, pet_context, channel_id),
             scene=_scene_for_segment(text, channel_id, pet_context),
             storyboard=storyboard,
             prompt="",

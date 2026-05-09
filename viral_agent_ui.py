@@ -25,6 +25,18 @@ from viral_agent.agent import format_generation_report, generate_detailed
 from viral_agent.ai_providers import apply_provider, get_provider, masked_key, provider_choices
 from viral_agent.seedance_prompt_builder import build_seedance_outputs, get_channel_choices, get_default_channel_id
 from viral_agent.sora_prompt_builder import build_sora_outputs
+from viral_agent.text_segmenter import (
+    segment_by_sentences,
+    format_segments_for_display,
+    segments_to_table_data,
+    validate_segments,
+)
+from viral_agent.prompt_agent import (
+    generate_video_prompts,
+    format_prompts_for_display,
+    prompts_to_table_data,
+    export_to_seedance_queue,
+)
 from douyin.douyin_downloader.pipeline import DouyinViralPipeline
 from douyin.douyin_downloader.transcriber import extract_transcript
 from scripts.claude_client import ClaudeClient
@@ -1149,9 +1161,137 @@ def _json_from_ai_text(text: str) -> dict:
     if content.startswith("```"):
         parts = content.split("```")
         content = parts[1] if len(parts) > 1 else content
-        if content.startswith("json"):
-            content = content[4:]
-    return json.loads(content.strip())
+        if content.lstrip().startswith("json"):
+            content = content.lstrip()[4:]
+
+    start = content.find("{")
+    end = content.rfind("}")
+    if start >= 0 and end > start:
+        content = content[start:end + 1]
+
+    content = content.strip()
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError as first_error:
+        candidates = [
+            re.sub(r",(\s*[}\]])", r"\1", content),
+            _escape_loose_quotes_in_json_strings(re.sub(r",(\s*[}\]])", r"\1", content)),
+        ]
+        for fixed in candidates:
+            try:
+                return json.loads(fixed)
+            except json.JSONDecodeError:
+                continue
+
+        try:
+            return _parse_clean_transcript_loose_json(content)
+        except Exception:
+            lines = content.splitlines() or [content]
+            error_line = max(1, getattr(first_error, "lineno", 1))
+            context_start = max(0, error_line - 3)
+            context_end = min(len(lines), error_line + 2)
+            context = "\n".join(
+                f"{line_no + 1:3d}: {lines[line_no]}"
+                for line_no in range(context_start, context_end)
+            )
+            raise ValueError(
+                f"AI 返回的 JSON 解析失败：第 {first_error.lineno} 行第 {first_error.colno} 列，"
+                f"{first_error.msg}\n上下文:\n{context}"
+            ) from first_error
+
+
+def _escape_loose_quotes_in_json_strings(text: str) -> str:
+    """Escape AI-produced bare quotes inside JSON string values."""
+    result: list[str] = []
+    in_string = False
+    escaped = False
+
+    for index, char in enumerate(text):
+        if char != '"' or escaped:
+            result.append(char)
+            escaped = (char == "\\" and not escaped)
+            if char != "\\":
+                escaped = False
+            continue
+
+        if not in_string:
+            in_string = True
+            result.append(char)
+            escaped = False
+            continue
+
+        next_non_space = ""
+        for next_char in text[index + 1:]:
+            if not next_char.isspace():
+                next_non_space = next_char
+                break
+
+        if next_non_space in {":", ",", "}", "]"}:
+            in_string = False
+            result.append(char)
+        else:
+            result.append('\\"')
+        escaped = False
+
+    return "".join(result)
+
+
+def _loose_json_field(text: str, key: str) -> str | None:
+    match = re.search(rf'"{re.escape(key)}"\s*:\s*', text)
+    if not match:
+        return None
+    index = match.end()
+    while index < len(text) and text[index].isspace():
+        index += 1
+    if index >= len(text) or text[index] != '"':
+        return None
+
+    start = index + 1
+    index = start
+    while index < len(text):
+        if text[index] == '"' and (index == 0 or text[index - 1] != "\\"):
+            probe = index + 1
+            while probe < len(text) and text[probe].isspace():
+                probe += 1
+            if probe >= len(text) or text[probe] in {",", "}"}:
+                return text[start:index].replace('\\"', '"')
+        index += 1
+    return None
+
+
+def _loose_json_int(text: str, key: str, default: int = 0) -> int:
+    match = re.search(rf'"{re.escape(key)}"\s*:\s*(\d+)', text)
+    return int(match.group(1)) if match else default
+
+
+def _loose_json_bool(text: str, key: str, default: bool = False) -> bool:
+    match = re.search(rf'"{re.escape(key)}"\s*:\s*(true|false)', text, flags=re.IGNORECASE)
+    if not match:
+        return default
+    return match.group(1).lower() == "true"
+
+
+def _loose_json_string_list(text: str, key: str) -> list[str]:
+    match = re.search(rf'"{re.escape(key)}"\s*:\s*\[(.*?)\]', text, flags=re.DOTALL)
+    if not match:
+        return []
+    values = re.findall(r'"((?:\\"|[^"])*)"', match.group(1))
+    return [value.replace('\\"', '"') for value in values]
+
+
+def _parse_clean_transcript_loose_json(text: str) -> dict:
+    cleaned_text = _loose_json_field(text, "cleaned_text")
+    if not cleaned_text:
+        raise ValueError("missing cleaned_text")
+    return {
+        "cleaned_text": cleaned_text,
+        "quality_score": _loose_json_int(text, "quality_score"),
+        "match_score": _loose_json_int(text, "match_score"),
+        "needs_review": _loose_json_bool(text, "needs_review"),
+        "issues": _loose_json_string_list(text, "issues"),
+        "corrections": [],
+        "summary": _loose_json_field(text, "summary") or "",
+    }
 
 
 def _clean_transcript_with_ai(
@@ -1168,6 +1308,7 @@ def _clean_transcript_with_ai(
 2. 如果原始转录和标题/标签明显不匹配，要标记 needs_review=true，不要强行改写。
 3. 宠物领域常见词要优先纠正，例如：遛弯、凑过来、嫌弃、撒娇、贴贴、小型犬、认知、同类、任职/认知等按上下文判断。
 4. 输出文本要保留短视频口播感，适合后续分析钩子、结构、情绪和观点。
+5. JSON 字符串内不要使用未转义英文双引号；需要引用原话时优先使用中文引号“”。
 
 【样本信息】
 标题：{title}
@@ -2641,6 +2782,366 @@ python sora_queue.py /path/to/sora_queue.json --output-dir /path/to/outputs
                 run_generate,
                 inputs=[topic_input, niche_input3, req_input, versions_input, api_key_input, base_url_input, model_input, provider_input],
                 outputs=[gen_output, gen_saved_dropdown, gen_save_status, saved_script_text, saved_status],
+            )
+
+        with gr.Tab("🎯 智能分段+提示词"):
+            gr.Markdown("""
+## 智能分段 + 视频提示词生成
+
+**新功能：** 独立的两步式工作流，与现有功能完全独立。
+
+### 工作流程
+1. **步骤1：智能分段** - 按句子完整性分段，每段约10秒（最长15秒）
+2. **步骤2：生成提示词** - AI理解上下文，为每段生成连贯的视频提示词
+
+### 特点
+- 考虑句子完整性，不会在句子中间切断
+- 支持 Seedance 2.0（最长15秒视频）
+- AI智能生成连贯镜头描述
+- 可导出到项目队列
+""")
+
+            # ========== 步骤1：输入文案 ==========
+            gr.Markdown("### 步骤1：输入文案")
+
+            with gr.Row():
+                with gr.Column(scale=2):
+                    smart_seg_saved_dropdown = gr.Dropdown(
+                        label="已保存的文案",
+                        choices=generated_script_choices(),
+                        interactive=True,
+                        scale=3,
+                    )
+                smart_seg_refresh_saved_btn = gr.Button("刷新列表", scale=1)
+                smart_seg_load_saved_btn = gr.Button("载入", variant="primary", scale=1)
+
+            smart_seg_saved_status = gr.Markdown(value=f"已保存 {len(generated_script_choices())} 条文案。")
+
+            smart_seg_input_text = gr.Textbox(
+                label="完整文案（可编辑）",
+                lines=12,
+                placeholder="输入或载入完整文案...",
+            )
+
+            # ========== 步骤2：智能分段 ==========
+            gr.Markdown("### 步骤2：智能分段")
+
+            with gr.Row():
+                smart_seg_method = gr.Radio(
+                    label="分段方式",
+                    choices=[
+                        ("🤖 AI 智能分段（理解语义和情节）", "ai"),
+                        ("⚡ 算法分段（快速、基于句子边界）", "algorithm"),
+                    ],
+                    value="algorithm",
+                    scale=2,
+                )
+
+            with gr.Row():
+                smart_seg_target_duration = gr.Slider(
+                    label="目标时长（秒/段）",
+                    minimum=5,
+                    maximum=15,
+                    value=10,
+                    step=1,
+                )
+                smart_seg_max_duration = gr.Slider(
+                    label="最大时长（秒/段）",
+                    minimum=10,
+                    maximum=15,
+                    value=15,
+                    step=1,
+                )
+                smart_seg_chars_per_sec = gr.Slider(
+                    label="口播速度（字/秒）",
+                    minimum=4.0,
+                    maximum=8.0,
+                    value=6.0,
+                    step=0.5,
+                )
+
+            smart_seg_segment_btn = gr.Button("🔪 开始智能分段", variant="primary", size="lg")
+
+            smart_seg_result_display = gr.Markdown(label="分段结果")
+            smart_seg_result_table = gr.Dataframe(
+                headers=["序号", "时间轴", "时长", "字数", "文案预览"],
+                label="分段详情",
+                interactive=False,
+            )
+            smart_seg_validation = gr.Markdown(label="验证结果")
+
+            # 隐藏字段：存储分段结果
+            smart_seg_segments_json = gr.Textbox(visible=False)
+
+            # ========== 步骤3：生成提示词 ==========
+            gr.Markdown("### 步骤3：生成视频提示词")
+
+            with gr.Row():
+                smart_seg_channel = gr.Dropdown(
+                    label="视觉风格（频道）",
+                    choices=get_channel_choices(),
+                    value=get_default_channel_id(),
+                    scale=3,
+                )
+                smart_seg_continuity = gr.Checkbox(
+                    label="保持场景连贯",
+                    value=True,
+                    scale=1,
+                )
+
+            smart_seg_generate_prompts_btn = gr.Button("🎬 生成视频提示词", variant="primary", size="lg")
+
+            smart_seg_prompts_display = gr.Markdown(label="提示词结果")
+            smart_seg_prompts_table = gr.Dataframe(
+                headers=["序号", "时间轴", "文案", "提示词"],
+                label="提示词详情",
+                interactive=False,
+            )
+
+            # 隐藏字段：存储提示词结果
+            smart_seg_prompts_json = gr.Textbox(visible=False)
+
+            # ========== 步骤4：导出 ==========
+            gr.Markdown("### 步骤4：导出到项目")
+
+            with gr.Row():
+                smart_seg_project_name = gr.Textbox(
+                    label="项目名称",
+                    placeholder="留空则自动生成",
+                    scale=2,
+                )
+                smart_seg_ratio = gr.Dropdown(
+                    label="视频比例",
+                    choices=["9:16", "16:9", "1:1"],
+                    value="16:9",
+                    scale=1,
+                )
+                smart_seg_model = gr.Dropdown(
+                    label="模型版本",
+                    choices=["seedance2.0", "seedance2.0fast", "seedance2.0_vip", "seedance2.0fast_vip"],
+                    value="seedance2.0fast",
+                    scale=1,
+                )
+
+            with gr.Row():
+                smart_seg_export_new_btn = gr.Button("📦 导出为新项目", variant="primary")
+                smart_seg_export_existing_btn = gr.Button("📥 导入到现有项目", variant="secondary")
+                smart_seg_project_dropdown = gr.Dropdown(
+                    label="选择项目",
+                    choices=project_choices(),
+                    value=active_project_id(),
+                    scale=2,
+                )
+
+            smart_seg_export_status = gr.Markdown()
+
+            # ========== 事件绑定 ==========
+
+            # 刷新和载入文案
+            smart_seg_refresh_saved_btn.click(
+                refresh_generated_scripts,
+                outputs=[smart_seg_saved_dropdown, smart_seg_saved_status],
+            )
+
+            smart_seg_load_saved_btn.click(
+                load_saved_generated_script,
+                inputs=[smart_seg_saved_dropdown],
+                outputs=[
+                    gr.Textbox(visible=False),  # gen_output placeholder
+                    smart_seg_input_text,
+                    gr.Textbox(visible=False),  # topic_input placeholder
+                    gr.Textbox(visible=False),  # niche_input3 placeholder
+                    gr.Textbox(visible=False),  # req_input placeholder
+                    gr.Number(visible=False),   # versions_input placeholder
+                    smart_seg_saved_status,
+                ],
+            )
+
+            # 智能分段
+            def do_smart_segment(text, method, target_duration, max_duration, chars_per_sec, provider_id):
+                if not text or not text.strip():
+                    return "❌ 请先输入文案", [], "❌ 没有分段结果", ""
+
+                try:
+                    if method == "ai":
+                        # AI 智能分段
+                        from viral_agent.text_segmenter import segment_by_sentences_ai
+                        segments = segment_by_sentences_ai(
+                            text=text,
+                            target_duration=int(target_duration),
+                            max_duration=int(max_duration),
+                            chars_per_second=float(chars_per_sec),
+                            provider_id=provider_id,
+                        )
+                    else:
+                        # 算法分段
+                        segments = segment_by_sentences(
+                            text=text,
+                            target_duration=int(target_duration),
+                            max_duration=int(max_duration),
+                            chars_per_second=float(chars_per_sec),
+                        )
+
+                    if not segments:
+                        return "❌ 分段失败，请检查文案内容", [], "❌ 没有分段结果", ""
+
+                    display = format_segments_for_display(segments)
+                    table = segments_to_table_data(segments)
+                    validation = validate_segments(segments, max_duration=int(max_duration))
+
+                    method_name = "🤖 AI 智能分段" if method == "ai" else "⚡ 算法分段"
+                    validation_text = f"**分段方式：** {method_name}\n\n"
+                    validation_text += f"**验证结果：** {'✅ 通过' if validation['valid'] else '⚠️ 有警告'}\n\n"
+                    validation_text += f"**统计：** {validation['stats']['total_segments']}段 | "
+                    validation_text += f"总时长 {validation['stats']['total_duration']}秒 | "
+                    validation_text += f"平均 {validation['stats']['avg_duration']}秒/段\n\n"
+
+                    if validation['warnings']:
+                        validation_text += "**警告：**\n"
+                        for warning in validation['warnings']:
+                            validation_text += f"- {warning}\n"
+
+                    segments_json = json.dumps(segments, ensure_ascii=False)
+
+                    return display, table, validation_text, segments_json
+
+                except Exception as exc:
+                    return f"❌ 分段失败：{exc}", [], f"❌ 错误：{exc}", ""
+
+            smart_seg_segment_btn.click(
+                do_smart_segment,
+                inputs=[smart_seg_input_text, smart_seg_method, smart_seg_target_duration, smart_seg_max_duration, smart_seg_chars_per_sec, provider_input],
+                outputs=[smart_seg_result_display, smart_seg_result_table, smart_seg_validation, smart_seg_segments_json],
+            )
+
+            # 生成提示词
+            def do_generate_prompts(segments_json, full_text, channel_id, continuity, provider_id):
+                if not segments_json or not segments_json.strip():
+                    return "❌ 请先完成智能分段", [], ""
+
+                try:
+                    segments = json.loads(segments_json)
+                    if not segments:
+                        return "❌ 分段数据为空", [], ""
+
+                    prompts = generate_video_prompts(
+                        segments=segments,
+                        full_context=full_text,
+                        channel_id=channel_id,
+                        scene_continuity=continuity,
+                        provider_id=provider_id,
+                    )
+
+                    if not prompts:
+                        return "❌ 提示词生成失败", [], ""
+
+                    display = format_prompts_for_display(prompts)
+                    table = prompts_to_table_data(prompts)
+                    prompts_json = json.dumps(prompts, ensure_ascii=False)
+
+                    return display, table, prompts_json
+
+                except json.JSONDecodeError:
+                    return "❌ 分段数据格式错误", [], ""
+                except Exception as exc:
+                    return f"❌ 生成失败：{exc}", [], ""
+
+            smart_seg_generate_prompts_btn.click(
+                do_generate_prompts,
+                inputs=[smart_seg_segments_json, smart_seg_input_text, smart_seg_channel, smart_seg_continuity, provider_input],
+                outputs=[smart_seg_prompts_display, smart_seg_prompts_table, smart_seg_prompts_json],
+            )
+
+            # 导出为新项目
+            def do_export_new_project(prompts_json, project_name, script, ratio, model):
+                if not prompts_json or not prompts_json.strip():
+                    return gr.update(), "❌ 请先生成提示词"
+
+                try:
+                    prompts = json.loads(prompts_json)
+                    if not prompts:
+                        return gr.update(), "❌ 提示词数据为空"
+
+                    name = str(project_name or "").strip() or default_seedance_project_name(script)
+                    project = create_web_project(name, description="智能分段+提示词自动创建")
+
+                    queue_data = export_to_seedance_queue(
+                        prompts=prompts,
+                        project_name=name,
+                        ratio=ratio,
+                        model_version=model,
+                    )
+                    queue_data["created_at"] = datetime.now().isoformat(timespec="seconds")
+
+                    queue_path = project_queue_path(str(project["id"]))
+                    save_json(queue_path, queue_data)
+
+                    choices = project_choices()
+                    status = f"✅ 已创建新项目「{project['name']}」\n\n"
+                    status += f"- 项目ID: {project['id']}\n"
+                    status += f"- 队列文件: {queue_path}\n"
+                    status += f"- 片段数: {len(prompts)}\n"
+
+                    return gr.update(choices=choices, value=project["id"]), status
+
+                except json.JSONDecodeError:
+                    return gr.update(), "❌ 提示词数据格式错误"
+                except Exception as exc:
+                    return gr.update(), f"❌ 导出失败：{exc}"
+
+            smart_seg_export_new_btn.click(
+                do_export_new_project,
+                inputs=[smart_seg_prompts_json, smart_seg_project_name, smart_seg_input_text, smart_seg_ratio, smart_seg_model],
+                outputs=[smart_seg_project_dropdown, smart_seg_export_status],
+            )
+
+            # 导入到现有项目
+            def do_export_existing_project(prompts_json, project_id, ratio, model):
+                if not prompts_json or not prompts_json.strip():
+                    return "❌ 请先生成提示词"
+
+                try:
+                    prompts = json.loads(prompts_json)
+                    if not prompts:
+                        return "❌ 提示词数据为空"
+
+                    project = project_by_id(project_id or active_project_id())
+                    if not project:
+                        return "❌ 请先选择项目"
+
+                    queue_path = project_queue_path(str(project["id"]))
+                    current = load_json(queue_path, {"version": 1, "segments": []})
+
+                    queue_data = export_to_seedance_queue(
+                        prompts=prompts,
+                        project_name=project.get("name", ""),
+                        ratio=ratio,
+                        model_version=model,
+                    )
+
+                    current_segments = current.get("segments", [])
+                    current_segments.extend(queue_data["segments"])
+                    current["segments"] = current_segments
+                    current["updated_at"] = datetime.now().isoformat(timespec="seconds")
+
+                    save_json(queue_path, current)
+
+                    status = f"✅ 已导入到项目「{project['name']}」\n\n"
+                    status += f"- 新增片段: {len(prompts)}\n"
+                    status += f"- 总片段数: {len(current_segments)}\n"
+                    status += f"- 队列文件: {queue_path}\n"
+
+                    return status
+
+                except json.JSONDecodeError:
+                    return "❌ 提示词数据格式错误"
+                except Exception as exc:
+                    return f"❌ 导入失败：{exc}"
+
+            smart_seg_export_existing_btn.click(
+                do_export_existing_project,
+                inputs=[smart_seg_prompts_json, smart_seg_project_dropdown, smart_seg_ratio, smart_seg_model],
+                outputs=[smart_seg_export_status],
             )
 
     gr.Markdown("""

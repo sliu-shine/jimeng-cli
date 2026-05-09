@@ -1,13 +1,13 @@
 {
-  "pid": 75974,
+  "pid": 9744,
   "running": false,
   "started_at": null,
   "queue_file": "/Users/sliu/web-project/rich-projects/jimeng-cli/.webui/global.queue.json",
   "output_root": "/Users/sliu/web-project/rich-projects/jimeng-cli/web-output",
   "state_file": "/Users/sliu/web-project/rich-projects/jimeng-cli/.webui/queue-state.json",
   "dreamina": "/Users/sliu/.local/bin/dreamina",
-  "active_project_id": "project-096dd57a9e",
-  "active_project_name": "你知道女生晚上遇到危险，什么狗才真的靠谱【版本1 - 痛点型+恐惧型】",
+  "active_project_id": "project-43c6ab95fe",
+  "active_project_name": "暹罗猫最怕的东西你绝对想不到不是-0509-0203",
   "command": [
     "/opt/miniconda3/bin/python",
     "/Users/sliu/web-project/rich-projects/jimeng-cli/dreamina_queue.py",
@@ -26,5 +26,5 @@
   ],
   "log_file": "/Users/sliu/web-project/rich-projects/jimeng-cli/.webui/runner.log",
   "queued_while_running": false,
-  "finished_at": "2026-05-08T16:58:36+0800"
+  "finished_at": "2026-05-09T10:44:58+0800"
 }

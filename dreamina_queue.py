@@ -995,6 +995,17 @@ def should_stop_queue_for_failure(fail_reason: str | None) -> bool:
     return "exceedconcurrencylimit" in text or "ret=1310" in text
 
 
+def is_transient_empty_query_failure(result: CommandResult, status: str | None) -> bool:
+    return (
+        result.returncode != 0
+        and status not in TERMINAL_STATUSES
+        and not result.stdout.strip()
+        and not result.stderr.strip()
+        and len(result.command) >= 2
+        and result.command[1] == "query_result"
+    )
+
+
 def persist_command_logs(base_dir: Path, prefix: str, result: CommandResult) -> None:
     ensure_dir(base_dir)
     write_text(base_dir / f"{prefix}.stdout.log", result.stdout)
@@ -1092,6 +1103,11 @@ def wait_for_completion(
         status = parsed.get("gen_status")
         if on_status:
             on_status(parsed, result)
+
+        if is_transient_empty_query_failure(result, status):
+            log(f"submit_id={submit_id} 查询暂时无输出，{poll_interval}s 后继续查询")
+            time.sleep(poll_interval)
+            continue
 
         if result.returncode != 0 and status not in TERMINAL_STATUSES:
             raise RuntimeError(command_failure_reason(result, "查询阶段"))
