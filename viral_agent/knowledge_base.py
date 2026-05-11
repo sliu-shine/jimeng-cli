@@ -3,6 +3,8 @@
 使用 ChromaDB（本地，无需服务器）
 """
 import json
+import math
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 import chromadb
@@ -13,6 +15,158 @@ DB_PATH = Path(__file__).parent.parent / ".viral_kb"
 
 # 全局单例，避免重复初始化
 _collection = None
+
+
+def _as_float(value, default: float = 0.0) -> float:
+    try:
+        if value in (None, ""):
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _norm_log(value, cap: float) -> float:
+    value = max(0.0, _as_float(value))
+    if cap <= 0:
+        return 0.0
+    return min(1.0, math.log1p(value) / math.log1p(cap))
+
+
+def _norm_score(value, scale: float = 10.0) -> float:
+    value = max(0.0, _as_float(value))
+    if value > scale and value <= 100:
+        value = value / 10
+    return min(1.0, value / scale) if scale else 0.0
+
+
+def _parse_datetime(value) -> Optional[datetime]:
+    if not value:
+        return None
+    if isinstance(value, (int, float)):
+        timestamp = value / 1000 if value > 10000000000 else value
+        try:
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        except (OSError, OverflowError, ValueError):
+            return None
+    text = str(value).strip()
+    if text.isdigit():
+        timestamp = int(text)
+        timestamp = timestamp / 1000 if timestamp > 10000000000 else timestamp
+        try:
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        except (OSError, OverflowError, ValueError):
+            return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _recency_score(meta: dict) -> float:
+    published = (
+        meta.get("publish_time")
+        or meta.get("published_at")
+        or meta.get("create_time")
+        or meta.get("created_at")
+        or meta.get("download_time")
+    )
+    dt = _parse_datetime(published)
+    if not dt:
+        return 0.5
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    days = max(0, (datetime.now(timezone.utc) - dt).days)
+    if days <= 30:
+        return 1.0
+    if days <= 180:
+        return 0.8
+    if days <= 365:
+        return 0.65
+    if days <= 730:
+        return 0.45
+    return 0.3
+
+
+def _rate(numerator, denominator) -> float:
+    denominator = _as_float(denominator)
+    if denominator <= 0:
+        return 0.0
+    return max(0.0, _as_float(numerator) / denominator)
+
+
+def _performance_score(meta: dict) -> float:
+    likes = _as_float(meta.get("likes"))
+    views = _as_float(meta.get("views") or meta.get("play_count") or meta.get("plays"))
+    comments = _as_float(meta.get("comments") or meta.get("comment_count"))
+    shares = _as_float(meta.get("shares") or meta.get("share_count"))
+    favorites = _as_float(meta.get("favorites") or meta.get("collects") or meta.get("collect_count"))
+    completion_rate = _as_float(meta.get("completion_rate") or meta.get("finish_rate"))
+
+    raw_engagement = (
+        0.46 * _norm_log(likes, 100000)
+        + 0.18 * _norm_log(comments, 20000)
+        + 0.18 * _norm_log(shares, 20000)
+        + 0.10 * _norm_log(favorites, 30000)
+        + 0.08 * _norm_log(views, 3000000)
+    )
+    if views > 0:
+        rate_score = (
+            0.45 * min(1.0, _rate(likes, views) / 0.08)
+            + 0.20 * min(1.0, _rate(comments, views) / 0.012)
+            + 0.20 * min(1.0, _rate(shares, views) / 0.012)
+            + 0.15 * min(1.0, _rate(favorites, views) / 0.02)
+        )
+        raw_engagement = 0.72 * raw_engagement + 0.28 * rate_score
+    if completion_rate:
+        raw_engagement = 0.85 * raw_engagement + 0.15 * min(1.0, completion_rate / 100 if completion_rate > 1 else completion_rate)
+    return min(1.0, raw_engagement)
+
+
+def _quality_signal(meta: dict) -> float:
+    transcript_quality = _as_float(meta.get("transcript_quality"))
+    if transcript_quality > 10:
+        transcript_quality = transcript_quality / 10
+    quality = _norm_score(meta.get("quality_score"), 10)
+    replication = _norm_score(meta.get("replication_score"), 10)
+    if transcript_quality:
+        return min(1.0, 0.40 * quality + 0.40 * replication + 0.20 * min(1.0, transcript_quality / 10))
+    return min(1.0, 0.50 * quality + 0.50 * replication)
+
+
+def _hybrid_rank_score(meta: dict, similarity: float, niche: Optional[str] = None) -> tuple[float, dict]:
+    similarity_score = max(0.0, min(1.0, _as_float(similarity)))
+    performance = _performance_score(meta)
+    quality = _quality_signal(meta)
+    recency = _recency_score(meta)
+    niche_match = 1.0 if niche and str(meta.get("niche") or meta.get("channel") or "").strip() == str(niche).strip() else 0.0
+    transcript_penalty = 0.0
+    transcript_quality = _as_float(meta.get("transcript_quality"))
+    if transcript_quality and transcript_quality < 60:
+        transcript_penalty = 0.08
+
+    score = (
+        0.46 * similarity_score
+        + 0.24 * performance
+        + 0.18 * quality
+        + 0.07 * recency
+        + 0.05 * niche_match
+        - transcript_penalty
+    )
+    breakdown = {
+        "similarity": round(similarity_score, 4),
+        "performance": round(performance, 4),
+        "quality": round(quality, 4),
+        "recency": round(recency, 4),
+        "niche_match": round(niche_match, 4),
+        "transcript_penalty": round(transcript_penalty, 4),
+    }
+    return round(max(0.0, min(1.0, score)), 4), breakdown
 
 
 def get_db():
@@ -52,6 +206,8 @@ def add_script(
         "niche": metadata.get("niche", ""),
         "channel": metadata.get("channel", ""),
         "source_account": metadata.get("source_account", metadata.get("author", "")),
+        "account_type": metadata.get("account_type") or "",
+        "content_type": metadata.get("content_type") or analysis.get("topic_type", ""),
         "hook_type": analysis.get("hook_type", ""),
         "hook": analysis.get("hook", ""),
         "topic_type": analysis.get("topic_type", ""),
@@ -95,14 +251,18 @@ def delete_script(video_id: str) -> bool:
     return existed
 
 
-def search_scripts(query: str, n: int = 5, niche: Optional[str] = None) -> list[dict]:
-    """语义检索相似爆款文案"""
+def search_scripts(query: str, n: int = 5, niche: Optional[str] = None, candidate_multiplier: int = 6) -> list[dict]:
+    """语义召回后用互动、质量、复刻、时效等信号混合排序。"""
     collection = get_db()
+    total = collection.count()
+    if total == 0:
+        return []
 
     where = {"niche": niche} if niche else None
+    candidate_count = min(total, max(int(n), int(n) * max(1, int(candidate_multiplier)), 30))
     results = collection.query(
         query_texts=[query],
-        n_results=min(n, collection.count() or 1),
+        n_results=candidate_count,
         where=where,
     )
 
@@ -110,6 +270,8 @@ def search_scripts(query: str, n: int = 5, niche: Optional[str] = None) -> list[
     if results["ids"] and results["ids"][0]:
         for i, doc_id in enumerate(results["ids"][0]):
             meta = results["metadatas"][0][i]
+            similarity = 1 - results["distances"][0][i]
+            rank_score, score_breakdown = _hybrid_rank_score(meta, similarity, niche=niche)
             scripts.append({
                 "video_id": doc_id,
                 "script": meta.get("script", ""),
@@ -118,6 +280,8 @@ def search_scripts(query: str, n: int = 5, niche: Optional[str] = None) -> list[
                 "topic_type": meta.get("topic_type", ""),
                 "topic_formula": meta.get("topic_formula", ""),
                 "source_account": meta.get("source_account", ""),
+                "account_type": meta.get("account_type", ""),
+                "content_type": meta.get("content_type", meta.get("topic_type", "")),
                 "channel": meta.get("channel", ""),
                 "structure": meta.get("structure", ""),
                 "why_viral": meta.get("why_viral", ""),
@@ -127,20 +291,25 @@ def search_scripts(query: str, n: int = 5, niche: Optional[str] = None) -> list[
                 "replication_score": meta.get("replication_score", 0),
                 "analysis": json.loads(meta.get("analysis_json", "{}")),
                 "metadata": meta,
-                "similarity": 1 - results["distances"][0][i],
+                "similarity": similarity,
+                "rank_score": rank_score,
+                "score_breakdown": score_breakdown,
             })
-    return scripts
+    return sorted(scripts, key=lambda item: item.get("rank_score", 0), reverse=True)[:int(n)]
 
 
 def get_all_patterns(niche: Optional[str] = None) -> dict:
     """获取知识库中所有爆款的模式统计"""
     collection = get_db()
-    count = collection.count()
-    if count == 0:
+    total = collection.count()
+    if total == 0:
         return {"count": 0, "patterns": []}
 
     where = {"niche": niche} if niche else None
     results = collection.get(where=where, include=["metadatas"])
+    count = len(results.get("metadatas") or [])
+    if count == 0:
+        return {"count": 0, "patterns": []}
 
     hook_types = {}
     viral_elements = []

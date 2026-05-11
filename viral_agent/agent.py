@@ -3,10 +3,43 @@
 用 Claude API 做推理，手动管理检索→生成流程
 """
 import os
+import json
 import re
+from pathlib import Path
 from . import knowledge_base as kb
 from .ai_providers import apply_provider, list_providers
 from scripts.claude_client import ClaudeClient
+
+PROMPTS_DIR = Path(__file__).parent / "prompts"
+
+# niche 关键词 → prompt 文件名映射
+_NICHE_PROMPT_MAP = {
+    "宠物": "pet",
+    "pet": "pet",
+    "猫": "pet",
+    "狗": "pet",
+    "萌宠": "pet",
+}
+
+
+def _load_niche_rules(niche: str) -> str:
+    """按 niche 加载对应的运营规则 prompt 文件，找不到返回空字符串。"""
+    if not niche:
+        return ""
+    key = str(niche).strip().lower()
+    filename = _NICHE_PROMPT_MAP.get(key) or _NICHE_PROMPT_MAP.get(niche.strip())
+    if not filename:
+        # 模糊匹配：niche 包含关键词
+        for keyword, fname in _NICHE_PROMPT_MAP.items():
+            if keyword in niche:
+                filename = fname
+                break
+    if not filename:
+        return ""
+    path = PROMPTS_DIR / f"{filename}.md"
+    if path.exists():
+        return path.read_text(encoding="utf-8").strip()
+    return ""
 
 
 def _call_provider(prompt: str, provider_id: str | None = None) -> str:
@@ -153,6 +186,206 @@ def _plain_script_body(content: str) -> str:
     return re.sub(r"【版本\d+[^】]*】|（参考：[^）]*）", "", str(content or "")).strip()
 
 
+def _split_generated_versions(content: str) -> list[dict]:
+    text = str(content or "").strip()
+    if not text:
+        return []
+    pattern = re.compile(r"^【版本\s*(\d+)[^】]*】", flags=re.M)
+    matches = list(pattern.finditer(text))
+    if not matches:
+        return [{"index": 1, "content": text}]
+
+    versions = []
+    for idx, match in enumerate(matches):
+        start = match.start()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        versions.append({
+            "index": int(match.group(1)),
+            "content": text[start:end].strip(),
+        })
+    return versions
+
+
+def _parse_version_fields(content: str) -> dict:
+    """从版本内容中提取结构化字段：标题、描述、标签、封面图建议、封面文字建议"""
+    text = str(content or "").strip()
+
+    # 提取标题（在"标题："和下一个双换行或下一个字段标记之间）
+    title_match = re.search(r"标题[：:]\s*\n(.+?)(?=\n\n描述[：:]|\n\n标签推荐|\n描述[：:]|$)", text, re.S)
+    title = title_match.group(1).strip() if title_match else ""
+
+    # 提取描述（在"描述："和"标签推荐："之间）
+    desc_match = re.search(r"描述[：:]\s*\n(.+?)(?=\n\n标签推荐[：:]|\n标签推荐[：:]|$)", text, re.S)
+    description = desc_match.group(1).strip() if desc_match else ""
+
+    # 提取标签（在"标签推荐："和"封面图建议："之间）
+    tags_match = re.search(r"标签推荐[：:]\s*\n(.+?)(?=\n\n封面图建议|\n封面图建议|$)", text, re.S)
+    tags_text = tags_match.group(1).strip() if tags_match else ""
+    tags = [tag.strip().lstrip("#") for tag in re.split(r"[#\s]+", tags_text) if tag.strip()]
+
+    # 提取封面图建议（在"封面图建议："和"封面文字建议："之间）
+    cover_img_match = re.search(r"封面图建议[：:]\s*\n(.+?)(?=\n\n封面文字建议|\n封面文字建议|$)", text, re.S)
+    cover_image = cover_img_match.group(1).strip() if cover_img_match else ""
+
+    # 提取封面文字建议（在"封面文字建议："和"AI质检："之间，或到结尾）
+    cover_text_match = re.search(r"封面文字建议[：:]\s*\n(.+?)(?=\n\nAI质检[：:]|\nAI质检[：:]|$)", text, re.S)
+    cover_text = cover_text_match.group(1).strip() if cover_text_match else ""
+
+    return {
+        "title": title,
+        "description": description,
+        "tags": tags,
+        "cover_image": cover_image,
+        "cover_text": cover_text,
+    }
+
+
+def _extract_json_object(text: str):
+    clean = str(text or "").strip()
+    clean = re.sub(r"^```(?:json)?\s*|\s*```$", "", clean, flags=re.I | re.S).strip()
+    try:
+        return json.loads(clean)
+    except json.JSONDecodeError:
+        pass
+
+    starts = [i for i, char in enumerate(clean) if char in "[{"]
+    for start in starts:
+        expected_end = "]" if clean[start] == "[" else "}"
+        end = clean.rfind(expected_end)
+        while end > start:
+            try:
+                return json.loads(clean[start:end + 1])
+            except json.JSONDecodeError:
+                end = clean.rfind(expected_end, start, end)
+    raise ValueError("AI 质检返回不是有效 JSON")
+
+
+def _normalize_review_item(item: dict, index: int) -> dict:
+    def string_list(value) -> list[str]:
+        if isinstance(value, list):
+            return [str(part).strip() for part in value if str(part).strip()][:5]
+        if value:
+            return [str(value).strip()]
+        return []
+
+    raw_score = item.get("score") or item.get("评分") or 0
+    if isinstance(raw_score, str):
+        match = re.search(r"\d+(?:\.\d+)?", raw_score)
+        raw_score = match.group(0) if match else 0
+    score = int(float(raw_score))
+    score = max(0, min(100, score))
+    passed_value = item.get("passed", item.get("通过", score >= 75))
+    if isinstance(passed_value, str):
+        passed = passed_value.strip().lower() in {"true", "1", "yes", "y", "pass", "passed", "通过", "合格"}
+    else:
+        passed = bool(passed_value)
+
+    return {
+        "version": int(item.get("version") or item.get("版本") or index),
+        "score": score,
+        "passed": passed,
+        "strengths": string_list(item.get("strengths") or item.get("亮点")),
+        "problems": string_list(item.get("problems") or item.get("issues") or item.get("问题")),
+        "suggestion": str(item.get("suggestion") or item.get("optimization") or item.get("优化建议") or "").strip(),
+    }
+
+
+def _fallback_quality_reviews(versions: list[dict], references: list[dict], source_text: str) -> list[dict]:
+    reviews = []
+    for item in versions:
+        version_text = item["content"]
+        score = _score_generated_script(version_text, references, _shingle_similarity(source_text, version_text))
+        details = score.get("details") or []
+        reviews.append({
+            "version": item["index"],
+            "score": score["score"],
+            "passed": score["score"] >= 75,
+            "strengths": details[:3] or ["结构基本完整"],
+            "problems": [] if score["score"] >= 75 else ["需要人工复核标题、正文节奏和封面表达是否足够具体"],
+            "suggestion": "优先压缩重复表达，强化前3秒钩子、具体画面和评论引导。",
+            "fallback": True,
+        })
+    return reviews
+
+
+def _review_generated_versions(content: str, topic_context: str, niche: str, requirements: str, references: list[dict]) -> list[dict]:
+    versions = _split_generated_versions(content)
+    if not versions:
+        return []
+
+    review_input = "\n\n".join(
+        f"版本{item['index']}：\n{item['content'][:2200]}"
+        for item in versions
+    )
+    prompt = f"""你是短视频爆款文案的 AI 质检官。请对下面每一个版本独立质检，不能只给总体评价。
+
+用户输入与要求：
+{topic_context}
+{f'赛道：{niche}' if niche else ''}
+{f'额外要求：{requirements}' if requirements else ''}
+
+质检维度：
+1. 是否贴合原始主题/参考原文，是否跑题或照抄
+2. 每版是否具备完整发布成品包：标题、描述/正文、标签推荐、封面图建议、封面文字建议
+3. 爆款结构是否成立：前3秒钩子、冲突/痛点、信息增量、行动/评论引导
+4. 是否有 AI 腔、空泛、重复、模板化表达
+5. 是否存在夸大、绝对化、低俗、引战或平台风险
+6. 封面建议是否能形成点击理由，封面文字是否短、狠、清楚
+
+请只输出 JSON 数组，不要 Markdown，不要解释。数组长度必须等于版本数，每项格式：
+[
+  {{
+    "version": 1,
+    "score": 0-100,
+    "passed": true,
+    "strengths": ["最多3条亮点"],
+    "problems": ["最多3条问题，没有则为空数组"],
+    "suggestion": "一句具体优化建议"
+  }}
+]
+
+待质检内容：
+{review_input}
+"""
+    try:
+        data = _extract_json_object(_call_claude(prompt))
+        if isinstance(data, dict):
+            data = data.get("reviews") or data.get("versions") or []
+        reviews = [_normalize_review_item(item, index + 1) for index, item in enumerate(data) if isinstance(item, dict)]
+        by_version = {int(item["version"]): item for item in reviews}
+        ordered = [by_version.get(item["index"]) for item in versions]
+        if all(ordered):
+            return ordered
+    except Exception as exc:
+        print(f"⚠️ AI 质检失败，使用本地规则兜底：{exc}")
+    return _fallback_quality_reviews(versions, references, topic_context)
+
+
+def _append_quality_reviews(content: str, reviews: list[dict]) -> str:
+    versions = _split_generated_versions(content)
+    if not versions or not reviews:
+        return content
+
+    by_version = {int(item.get("version") or 0): item for item in reviews}
+    blocks = []
+    for item in versions:
+        review = by_version.get(item["index"])
+        block = item["content"].strip()
+        if review:
+            strengths = "；".join(review.get("strengths") or []) or "暂无明显亮点"
+            problems = "；".join(review.get("problems") or []) or "未发现明显问题"
+            status = "通过" if review.get("passed") else "需优化"
+            block += (
+                "\n\nAI质检：\n"
+                f"评分：{int(review.get('score') or 0)}/100（{status}）\n"
+                f"亮点：{strengths}\n"
+                f"问题：{problems}\n"
+                f"优化建议：{review.get('suggestion') or '可直接进入人工终审。'}"
+            )
+        blocks.append(block)
+    return "\n\n".join(blocks)
+
+
 def _suggest_publish_metadata(content: str, niche: str = "") -> dict:
     body = _plain_script_body(content)
     compact = _compact_text(body)
@@ -228,10 +461,54 @@ def _reference_report_items(similar: list[dict]) -> list[dict]:
             "niche": str(metadata.get("niche") or ""),
             "likes": int(float(item.get("likes") or 0)),
             "similarity": float(item.get("similarity") or 0),
+            "rank_score": float(item.get("rank_score") or 0),
+            "score_breakdown": item.get("score_breakdown") or {},
             "hook_type": item.get("hook_type", ""),
+            "hook": item.get("hook", ""),
+            "topic_type": item.get("topic_type", ""),
+            "topic_formula": item.get("topic_formula", ""),
+            "account_type": item.get("account_type", ""),
+            "content_type": item.get("content_type", ""),
             "structure": item.get("structure", ""),
+            "quality_score": int(float(item.get("quality_score") or 0)),
+            "replication_score": int(float(item.get("replication_score") or 0)),
+            "why_viral": item.get("why_viral", ""),
         })
     return items
+
+
+def _generation_strategy(similar: list[dict], stats: dict, search_query: str, niche: str, versions: int) -> dict:
+    hook_types = []
+    structures = []
+    content_types = []
+    for item in similar:
+        for key, bucket in [
+            ("hook_type", hook_types),
+            ("structure", structures),
+            ("content_type", content_types),
+        ]:
+            value = str(item.get(key) or "").strip()
+            if value and value not in bucket:
+                bucket.append(value)
+    return {
+        "retrieval": {
+            "query": search_query,
+            "requested_top_n": 5,
+            "ranking": "hybrid_similarity_performance_quality_recency",
+            "niche_filter": str(niche or "").strip(),
+        },
+        "selected_patterns": {
+            "hook_types": hook_types[:5],
+            "structures": structures[:5],
+            "content_types": content_types[:5],
+            "global_hook_distribution": stats.get("hook_types", {}),
+            "global_viral_elements": (stats.get("top_viral_elements") or [])[:10],
+        },
+        "generation": {
+            "versions": int(versions),
+            "format": "direct_publishable_oral_script",
+        },
+    }
 
 
 def format_generation_report(metadata: dict | None) -> str:
@@ -266,6 +543,7 @@ def format_generation_report(metadata: dict | None) -> str:
                 f"  {int(ref.get('rank') or 0)}. {title} · "
                 f"点赞 {int(ref.get('likes') or 0):,} · "
                 f"相似度 {float(ref.get('similarity') or 0):.0%} · "
+                f"综合分 {float(ref.get('rank_score') or 0):.0%} · "
                 f"{ref.get('hook_type') or '未知钩子'}"
             )
             extra = []
@@ -279,6 +557,15 @@ def format_generation_report(metadata: dict | None) -> str:
                 extra.append(f"链接：{ref['video_url']}")
             if extra:
                 lines.append(f"     {' · '.join(extra)}")
+    version_reviews = metadata.get("version_reviews") or []
+    if version_reviews:
+        lines.append("- **逐版本 AI质检：**")
+        for review in version_reviews:
+            status = "通过" if review.get("passed") else "需优化"
+            lines.append(
+                f"  - 版本{int(review.get('version') or 0)}："
+                f"{int(review.get('score') or 0)}/100 · {status}"
+            )
     return "\n".join(lines)
 
 
@@ -309,7 +596,7 @@ def generate_detailed(
     if similar:
         kb_context = "【知识库中的相关爆款】\n\n"
         for i, s in enumerate(similar, 1):
-            kb_context += f"爆款{i}（点赞{s['likes']:,}，相似度{s['similarity']:.2f}）\n"
+            kb_context += f"爆款{i}（点赞{s['likes']:,}，相似度{s['similarity']:.2f}，综合参考分{s.get('rank_score', 0):.2f}）\n"
             kb_context += f"钩子类型：{s['hook_type']}\n"
             kb_context += f"钩子公式：{s['analysis'].get('hook_formula', '')}\n"
             kb_context += f"结构：{s['structure']}\n"
@@ -326,14 +613,32 @@ def generate_detailed(
 
     format_blocks = "\n\n".join(
         [
-            f"【版本{i} - 钩子类型】\n（参考：借鉴了爆款X的XX公式）\n这里写完整口播文案正文，不要分析，不要说明"
+            f"""【版本{i} - 钩子类型】
+（参考：借鉴了爆款X的XX公式）
+标题：
+这里写一个适合发布页/标题栏的标题
+
+描述：
+这里写完整口播文案正文，不少于300字
+
+标签推荐：
+#标签1 #标签2 #标签3 #标签4 #标签5
+
+封面图建议：
+这里写具体可执行的封面画面建议，包含主体、动作、场景、情绪和构图
+
+封面文字建议：
+这里写一句适合放在封面上的短文字，12字以内优先"""
             for i in range(1, int(versions) + 1)
         ]
     )
 
+    niche_rules = _load_niche_rules(niche)
+    niche_rules_block = f"\n【{niche}赛道运营规则】\n{niche_rules}\n" if niche_rules else ""
+
     prompt = f"""你是一位顶级短视频爆款文案创作者。你的任务是直接交付可拍摄、可口播的短视频成片文案，不写创作说明，不写分析报告。
 
-{kb_context}{pattern_context}
+{kb_context}{pattern_context}{niche_rules_block}
 ---
 现在请基于以上爆款数据和用户输入，创作{versions}个版本的爆款短视频文案。用户要求几个版本，你就只输出几个版本，不要多输出：
 
@@ -347,10 +652,13 @@ def generate_detailed(
 3. 结构清晰：钩子→冲突/痛点→解决/干货→行动号召
 4. 口语化，真人讲述感
 5. 每个版本注明：借鉴了哪个爆款的结构/公式
-6. 每个版本必须是一整段能直接口播的正文，正文不少于300字
-7. 不要输出“创作说明”“版本对比分析”“共同优化点”“建议测试”“适合人群”等解释性内容
-8. 不要用项目符号拆分析点，除标题和参考行外，只输出文案正文
-9. 如果用户输入的是长参考原文，最终文案必须明显不同于原文：不能只是加几句开头，也不能按原文顺序逐句复述
+6. 每个版本必须是独立发布成品包，包含标题、描述、标签推荐、封面图建议、封面文字建议
+7. 描述必须是一整段能直接口播的正文，正文不少于300字
+8. 封面图建议必须具体到画面，不要写抽象形容词堆砌
+9. 封面文字建议必须短、清楚、有点击理由，不要超过16个字
+10. 不要输出“创作说明”“版本对比分析”“共同优化点”“建议测试”“适合人群”等解释性内容
+11. 不要用项目符号拆分析点，只按指定字段输出
+12. 如果用户输入的是长参考原文，最终文案必须明显不同于原文：不能只是加几句开头，也不能按原文顺序逐句复述
 
 只能使用下面格式输出：
 {format_blocks}
@@ -373,18 +681,46 @@ def generate_detailed(
         result = _call_claude(rewrite_prompt)
         similarity = _shingle_similarity(topic, result)
     references = _reference_report_items(similar)
-    viral_score = _score_generated_script(result, references, similarity)
-    publish = _suggest_publish_metadata(result, niche=niche)
+    print("🧪 逐版本 AI 质检中...")
+    version_reviews = _review_generated_versions(result, topic_context, niche, requirements, references)
+    reviewed_result = _append_quality_reviews(result, version_reviews)
+    viral_score = _score_generated_script(reviewed_result, references, similarity)
+    publish = _suggest_publish_metadata(reviewed_result, niche=niche)
+    strategy = _generation_strategy(similar, stats, search_query, niche, versions)
     metadata = {
         "references": references,
+        "strategy": strategy,
         "publish": publish,
+        "version_reviews": version_reviews,
         "source_similarity": similarity,
         "top_reference_similarity": max([item["similarity"] for item in references] or [0]),
+        "top_reference_rank_score": max([item["rank_score"] for item in references] or [0]),
         "viral_score": viral_score,
     }
     print("\n✅ 生成完毕\n")
+    # 拆分成独立版本列表，每个版本含正文、质检结果、版本号、结构化字段
+    by_review = {int(r.get("version") or 0): r for r in version_reviews}
+    versions_list = []
+    for item in _split_generated_versions(reviewed_result):
+        review = by_review.get(item["index"]) or {}
+        fields = _parse_version_fields(item["content"])
+        versions_list.append({
+            "index": item["index"],
+            "content": item["content"],
+            "title": fields["title"],
+            "description": fields["description"],
+            "tags": fields["tags"],
+            "cover_image": fields["cover_image"],
+            "cover_text": fields["cover_text"],
+            "score": int(review.get("score") or 0),
+            "passed": bool(review.get("passed")),
+            "strengths": review.get("strengths") or [],
+            "problems": review.get("problems") or [],
+            "suggestion": review.get("suggestion") or "",
+        })
     return {
-        "content": result,
+        "content": reviewed_result,
+        "versions_list": versions_list,
         "metadata": metadata,
         "report_markdown": format_generation_report(metadata),
     }

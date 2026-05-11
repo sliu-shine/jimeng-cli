@@ -1,13 +1,13 @@
 {
-  "pid": 9744,
+  "pid": 39956,
   "running": false,
   "started_at": null,
   "queue_file": "/Users/sliu/web-project/rich-projects/jimeng-cli/.webui/global.queue.json",
   "output_root": "/Users/sliu/web-project/rich-projects/jimeng-cli/web-output",
   "state_file": "/Users/sliu/web-project/rich-projects/jimeng-cli/.webui/queue-state.json",
   "dreamina": "/Users/sliu/.local/bin/dreamina",
-  "active_project_id": "project-43c6ab95fe",
-  "active_project_name": "暹罗猫最怕的东西你绝对想不到不是-0509-0203",
+  "active_project_id": "project-3e59033c94",
+  "active_project_name": "大多数人觉得狗爱你的证明是它扑过-0510-2349",
   "command": [
     "/opt/miniconda3/bin/python",
     "/Users/sliu/web-project/rich-projects/jimeng-cli/dreamina_queue.py",
@@ -26,5 +26,5 @@
   ],
   "log_file": "/Users/sliu/web-project/rich-projects/jimeng-cli/.webui/runner.log",
   "queued_while_running": false,
-  "finished_at": "2026-05-09T10:44:58+0800"
+  "finished_at": "2026-05-11T05:34:05+0800"
 }

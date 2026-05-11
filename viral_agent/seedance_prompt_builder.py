@@ -42,8 +42,10 @@ FIXED_STYLE_TEMPLATE = (
     "{pet_label}毛发蓬松柔软、层次清楚，脸部表情拟人化但不过度夸张，眼睛明亮有神，动作自然，"
     "情绪灵动，造型可爱治愈，全程角色造型稳定统一。场景为生活化二维动画场景，可以是温暖客厅、"
     "卧室、沙发边、阳光草地、公园、家庭地板、窗边等，所有场景都保持同一套温暖日系手绘动画质感。"
-    "科普示意画面只在分镜明确需要时出现，必须保持同一治愈动画风格，气味粒子、信任光圈、脆弱部位示意、"
-    "情绪云团等都要画成柔和、干净、温暖、易懂的动画化示意，不要冷冰冰科技风，不要真实医学图，不要恐怖微观画面。"
+    "科普示意画面只在分镜明确需要时出现，必须保持同一治愈动画风格，用儿童绘本插画的方式表达科普内容："
+    "气味用可爱的小爪印或波浪线符号、情绪用小星星或小爱心、大脑用Q版简化图案、等级用高低台阶或云朵比喻、"
+    "声音用音符符号、信任用心形光圈连接线。所有科普符号都要像宫崎骏电影或儿童绘本里的插画元素一样温柔可爱，"
+    "不要冷冰冰科技风，不要真实医学图，不要恐怖微观画面，不要抽象粒子特效。"
 )
 FIXED_STYLE_TEMPLATE = str(PROMPT_CONFIG.get("default_style_template") or FIXED_STYLE_TEMPLATE)
 
@@ -128,6 +130,33 @@ GLOBAL_NEGATIVE_CONSTRAINTS = str(PROMPT_CONFIG.get("global", {}).get("negative_
     "屏幕上不要出现任何字幕、中文文字、英文文字、水印、logo、账号名、标题贴纸。"
     "不要真实摄影、不要写实真人脸部、不要3D建模感、不要水印、不要低清晰度画面。"
 ))
+
+# 精简版固定内容：一句风格定性 + 核心视觉规则 + 一次负面约束，控制在150字以内
+# 每个频道在 channel_styles.json 里配置 style_compact，没有则自动从 style_template 截取前80字兜底
+_COMPACT_NEGATIVE = "无字幕文字水印，无真实摄影，无3D，无人声口型，嘴巴自然闭合。"
+
+
+def _compact_style_for_channel(channel_id: str | None, pet_context: dict[str, str]) -> str:
+    """生成精简版固定风格描述，控制在150字以内。"""
+    # 优先读 channel_styles.json 里的 style_compact 字段
+    config = _load_channel_styles()
+    for channel in config.get("channels", []):
+        if isinstance(channel, dict) and str(channel.get("id", "")) == str(channel_id or ""):
+            compact = str(channel.get("style_compact", "")).strip()
+            if compact:
+                try:
+                    return _render_template(compact, pet_context)
+                except KeyError:
+                    return compact
+
+    # 兜底：从完整 style_template 截取前80字 + 固定负面约束
+    full = get_style_template_for_channel(channel_id)
+    try:
+        full = _render_template(full, pet_context)
+    except KeyError:
+        pass
+    truncated = full[:80].rstrip("，,。；; ") + "…"
+    return truncated
 
 
 CHANNEL_PROMPT_PROFILES = {
@@ -286,19 +315,22 @@ SCIENCE_KEYWORDS = {
     "微生物": "{pet_label}毛发表面出现温柔微观世界，小小发光微生物像暖色小精灵一样在毛发间活动",
     "菌群": "毛发间浮现柔和微生物群落，发出细小暖光",
     "代谢": "微生物释放柔和光点，气味粒子缓慢流向空气",
-    "气味": "暖黄色香气粒子从{pet_label}毛发间飘起，轻轻环绕主人",
-    "爆米花": "香气粒子幻化成小小爆米花意象，保持二维手绘质感",
-    "烤面包": "香气粒子幻化成小麦和烤面包的温柔意象",
-    "体温": "{pet_label}熟睡时身体周围出现柔和暖光和轻微热气",
+    "气味": "从{pet_label}身上飘出可爱的小爪印形状的香气符号，像绘本里的气味线条一样温柔飘向主人",
+    "爆米花": "香气符号变成Q版小爆米花图案，保持二维手绘质感，像儿童绘本插画",
+    "烤面包": "香气符号变成Q版小面包图案，暖黄色调，像绘本里的食物插画",
+    "体温": "{pet_label}熟睡时身体周围出现柔和暖光和轻微热气波纹，像温暖的小太阳",
     "毛孔": "{pet_label}毛发近景，毛孔微微张开，毛发自然蓬松被暖光照亮",
-    "DNA": "温柔发光的DNA双螺旋示意浮现，线条柔和，颜色温暖",
-    "大脑": "{pet_label}头部旁边出现半透明大脑结构示意，线条柔和干净",
-    "多巴胺": "大脑里金色小光点跳动扩散，形成温暖愉悦的视觉隐喻",
-    "狼": "远古草地上温顺的狼远远看着人类营地篝火和食物残渣",
-    "野猫": "温柔动画化的远古野猫在谷仓和人类居住地边缘观察食物与安全环境",
-    "祖先": "温柔远古场景中，猫狗祖先靠近人类生活区，画面像绘本一样柔和",
-    "嗅觉": "{pet_label}鼻尖微距特写，柔和气味粒子形成清晰路径",
-    "听觉": "{pet_label}耳朵轻轻转动，空气中出现柔和声波线条",
+    "DNA": "画面一侧出现可爱的双螺旋图案，像儿童科普绘本里的简化插图，线条圆润，颜色温暖",
+    "大脑": "{pet_label}头部旁边浮现Q版大脑图案，像绘本插画一样简化可爱，用小星星或小光点标注活跃区域",
+    "多巴胺": "Q版大脑图案里跳出金色小星星或小爱心，像绘本里表达开心的符号一样",
+    "狼": "远古草地上温顺的狼远远看着人类营地篝火和食物残渣，画面像儿童历史绘本",
+    "野猫": "温柔动画化的远古野猫在谷仓和人类居住地边缘观察食物与安全环境，像绘本故事插画",
+    "祖先": "温柔远古场景中，猫狗祖先靠近人类生活区，画面像儿童科普绘本一样柔和",
+    "嗅觉": "{pet_label}鼻尖微距特写，从鼻子飘出可爱的波浪线或小爪印符号，像漫画里表达气味的方式",
+    "听觉": "{pet_label}耳朵轻轻转动，耳朵周围出现可爱的音符符号或波浪线，像绘本里表达声音的方式",
+    "信任": "主人和{pet_label}之间出现温柔的心形光圈或连接线，像绘本里表达情感纽带的方式",
+    "等级": "{pet_label}和主人站在不同高度的温柔台阶或云朵上，用高低差表达等级观念，像儿童绘本的比喻画法",
+    "食物等级": "画面分成三个温柔的区域，分别展示狗粮碗、地上的食物、主人手里的食物，用柔和的光圈或边框区分",
 }
 
 
@@ -939,13 +971,15 @@ def build_prompt_for_segment(
         pet_context,
         f"温馨治愈、轻科普、{pet_context['love_phrase']}",
     )
+    compact_style = _compact_style_for_channel(channel_id, pet_context)
+    motion = _render_profile_text(profile.get("motion"), pet_context)
     return (
-        f"{NO_DIALOGUE_CONSTRAINTS}{fixed_style_for_pet(pet_context, channel_id)} 16:9 横屏。{material_text}"
+        f"{compact_style} {_COMPACT_NEGATIVE} 16:9 横屏。{material_text}"
         f"本段主场景：{_sanitize_visual_text(segment.scene)}。"
         f"本段{pet_context['pet_label']}和主人状态：{_join_visual_state(segment.main_action, segment.emotion)}。"
         f"本段按时间轴分镜：{storyboard_text} "
         f"主情绪氛围：{emotion_atmosphere}。"
-        f"{profile['motion']}{GLOBAL_QUALITY_REQUIREMENTS}{GLOBAL_NEGATIVE_CONSTRAINTS}"
+        f"{motion}"
     )
 
 

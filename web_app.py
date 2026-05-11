@@ -405,25 +405,49 @@ def sync_project_queue_task(task: dict[str, Any]) -> None:
     queue_path = project_queue_file(project_id)
     document = parse_queue_document(queue_file_text(queue_path))
     changed = False
-    for segment in document.get("segments", []):
+    status_keys = [
+        "status",
+        "submit_id",
+        "gen_status",
+        "fail_reason",
+        "started_at",
+        "finished_at",
+        "download_dir",
+        "urls",
+        "retry_count",
+        "manual_retry_requested_at",
+    ]
+    segments = document.setdefault("segments", [])
+    for segment in segments:
         if str(segment.get("id") or "") != segment_id:
             continue
-        for key in [
-            "status",
-            "submit_id",
-            "gen_status",
-            "fail_reason",
-            "started_at",
-            "finished_at",
-            "download_dir",
-            "urls",
-            "retry_count",
-            "manual_retry_requested_at",
-        ]:
+        for key in status_keys:
             if key in task:
                 segment[key] = task.get(key)
         changed = True
         break
+    if not changed:
+        restored = {
+            "id": segment_id,
+            "name": str(task.get("segment_name") or task.get("name") or "片段").strip() or "片段",
+            "project_id": project_id,
+            "project_name": str(task.get("project_name") or "").strip(),
+            "command": str(task.get("command") or "").strip(),
+            "prompt": str(task.get("prompt") or "").strip(),
+            "images": task.get("images") if isinstance(task.get("images"), list) else [],
+            "transition_prompts": task.get("transition_prompts") if isinstance(task.get("transition_prompts"), list) else [],
+            "videos": task.get("videos") if isinstance(task.get("videos"), list) else [],
+            "audios": task.get("audios") if isinstance(task.get("audios"), list) else [],
+            "duration": str(task.get("duration") or "").strip(),
+            "ratio": str(task.get("ratio") or "").strip(),
+            "model_version": str(task.get("model_version") or "").strip(),
+            "label": str(task.get("label") or "").strip(),
+        }
+        for key in status_keys:
+            if key in task:
+                restored[key] = task.get(key)
+        segments.append(normalize_queue_segment(restored, len(segments) + 1))
+        changed = True
     if changed:
         document["updated_at"] = now_iso()
         queue_path.write_text(queue_document_to_text(document), encoding="utf-8")
@@ -4527,7 +4551,17 @@ class Handler(BaseHTTPRequestHandler):
                 active_project = set_active_project(project_id) if project_id else get_active_project()
                 queue_file = project_queue_file(active_project["id"]).expanduser().resolve()
                 ensure_dir(queue_file.parent)
-                document = merge_existing_segment_status(active_project["id"], parse_queue_document(str(payload.get("queue_content", ""))))
+                queue_content = str(payload.get("queue_content", "") or "")
+                if not queue_content.strip():
+                    self._send_json({
+                        "ok": True,
+                        "skipped": True,
+                        "reason": "队列内容为空，已跳过保存，避免清空项目队列。",
+                        "queue_file": str(queue_file),
+                        "project": active_project,
+                    })
+                    return
+                document = merge_existing_segment_status(active_project["id"], parse_queue_document(queue_content))
                 normalized = queue_document_to_text(document)
                 queue_file.write_text(normalized, encoding="utf-8")
                 self._send_json({"ok": True, "queue_file": str(queue_file), "project": active_project})

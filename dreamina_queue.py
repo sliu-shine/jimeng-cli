@@ -792,26 +792,49 @@ def sync_project_queue_task(task: dict[str, Any]) -> None:
     segments = document.get("segments")
     if not isinstance(segments, list):
         return
+    status_keys = [
+        "status",
+        "submit_id",
+        "gen_status",
+        "fail_reason",
+        "started_at",
+        "finished_at",
+        "download_dir",
+        "urls",
+        "retry_count",
+        "manual_retry_requested_at",
+    ]
     changed = False
     for segment in segments:
         if not isinstance(segment, dict) or str(segment.get("id") or "") != segment_id:
             continue
-        for key in [
-            "status",
-            "submit_id",
-            "gen_status",
-            "fail_reason",
-            "started_at",
-            "finished_at",
-            "download_dir",
-            "urls",
-            "retry_count",
-            "manual_retry_requested_at",
-        ]:
+        for key in status_keys:
             if key in task:
                 segment[key] = task.get(key)
         changed = True
         break
+    if not changed:
+        restored = {
+            "id": segment_id,
+            "name": str(task.get("segment_name") or task.get("name") or "片段").strip() or "片段",
+            "project_id": project_id,
+            "project_name": str(task.get("project_name") or "").strip(),
+            "command": str(task.get("command") or "").strip(),
+            "prompt": str(task.get("prompt") or "").strip(),
+            "images": task.get("images") if isinstance(task.get("images"), list) else [],
+            "transition_prompts": task.get("transition_prompts") if isinstance(task.get("transition_prompts"), list) else [],
+            "videos": task.get("videos") if isinstance(task.get("videos"), list) else [],
+            "audios": task.get("audios") if isinstance(task.get("audios"), list) else [],
+            "duration": str(task.get("duration") or "").strip(),
+            "ratio": str(task.get("ratio") or "").strip(),
+            "model_version": str(task.get("model_version") or "").strip(),
+            "label": str(task.get("label") or "").strip(),
+        }
+        for key in status_keys:
+            if key in task:
+                restored[key] = task.get(key)
+        segments.append(restored)
+        changed = True
     if changed:
         document["updated_at"] = now_iso()
         save_json(queue_path, document)

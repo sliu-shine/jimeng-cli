@@ -4,6 +4,7 @@
 """
 import os
 import re
+from pathlib import Path
 from typing import List, Dict, Optional
 from dataclasses import dataclass
 from scripts.claude_client import ClaudeClient
@@ -15,6 +16,38 @@ from .seedance_prompt_builder import (
     _channel_profile,
     _render_profile_text,
 )
+
+PROMPTS_DIR = Path(__file__).parent / "prompts"
+
+_NICHE_PROMPT_MAP = {
+    "宠物": "pet", "pet": "pet", "猫": "pet", "狗": "pet", "萌宠": "pet",
+}
+
+
+def _load_niche_storyboard_rules(niche: str = "") -> str:
+    """加载 niche 对应 prompt 文件中与分镜相关的运营规则。"""
+    key = str(niche).strip().lower()
+    filename = _NICHE_PROMPT_MAP.get(key) or _NICHE_PROMPT_MAP.get(niche.strip())
+    if not filename:
+        for keyword, fname in _NICHE_PROMPT_MAP.items():
+            if keyword in niche:
+                filename = fname
+                break
+    if not filename:
+        # 默认尝试 pet（宠物内容检测）
+        filename = "pet"
+    path = PROMPTS_DIR / f"{filename}.md"
+    if not path.exists():
+        return ""
+    text = path.read_text(encoding="utf-8")
+    # 只提取"前15秒结构"和"数据诊断"两节，其余（选题/封面/避坑）与分镜无关
+    sections = []
+    for section_title in ["前15秒结构", "数据诊断"]:
+        pattern = rf"(## {section_title}.*?)(?=\n## |\Z)"
+        match = re.search(pattern, text, re.S)
+        if match:
+            sections.append(match.group(1).strip())
+    return "\n\n".join(sections)
 
 
 @dataclass
@@ -38,6 +71,7 @@ def _call_claude_for_storyboard(
     pet_context: dict,
     channel_id: Optional[str] = None,
     provider_id: Optional[str] = None,
+    niche: str = "",
 ) -> list[str]:
     """
     使用 Claude API 理解文案内容，生成定制化的分镜描述
@@ -62,6 +96,9 @@ def _call_claude_for_storyboard(
     science_guidance = _render_profile_text(profile.get("science_guidance"), pet_context)
     motion = _render_profile_text(profile.get("motion"), pet_context)
 
+    niche_rules = _load_niche_storyboard_rules(niche or "宠物")
+    niche_rules_block = f"\n# 赛道运营规则（转化为画面时参考）\n{niche_rules}\n" if niche_rules else ""
+
     # 根据时长计算分镜数量
     shot_count = max(2, min(8, duration // 2))
 
@@ -78,47 +115,72 @@ def _call_claude_for_storyboard(
 - 分镜原则：{shot_guidance}
 - 科普原则：{science_guidance}
 - 分镜数量参考：约{shot_count}个，根据内容信息密度灵活增减
+{niche_rules_block}
+# 核心要求（按优先级排序）
 
-# 核心要求（非常重要！）
+## 优先级1：识别并视觉化文案的钩子（最重要！）
 
-1. **先把爆款节奏内化成具体画面，不要把规则文字写进输出**
-   - 开头策略：{hook_strategy}
-   - 前3秒：{first_3s_rule}
-   - 留存节奏：{retention_structure}
-   - 画面密度：{density_rule}
-   - 输出时不要写“爆款开头策略、前3秒视觉钩子、留存节奏原则、画面密度要求”等标签，只输出可见画面
+**第一步：识别文案的钩子是什么**
+- 仔细阅读文案的前1-2句话
+- 找出最吸引人的反差、误会、异常行为或悬念
+- 例如：你家狗叼着球过来，你一伸手它就跑 → 钩子是叼球来找你但不给你
 
-2. **分镜必须准确表达文案的具体内容**
-   - 如果文案说"深夜吃狗粮"，就要画{pet_label}起身走到狗盆前吃，不能画睡觉
-   - 如果文案说"食物分三档"，就要用画面展示三种食物的区别（狗粮、掉地上的、手喂的）
-   - 如果文案说"扔地上吃很快，手喂吃很慢"，就要有对比镜头展示速度差异
-   - 如果文案说"出门前摸头、听脚步声"，就要画出门和回家的场景
+**第二步：第一个分镜必须直接呈现这个钩子画面**
+- 不要从常规动作开始（如主人扔球）
+- 直接画出文案里描述的那个吸引人的场景
+- 例如：应该画狗叼球凑过来，主人伸手，狗转身跑开，而不是主人扔球
 
-3. **避免通用模板**
-   - 不要每段都是"抬头-摸头-暖光扩散"
-   - 要根据文案的具体情节设计画面
-   - 每个分镜要有信息变化，不要重复
+**第三步：后续分镜承接钩子，展开解释**
+- 第2-3个分镜可以解释为什么（科普示意）
+- 第4-5个分镜展示正确做法或对比
+- 最后收束在温馨画面
 
-4. **画面要可视化文案的核心信息**
-   - 用动画化的方式表现抽象概念（如"等级观念"可以用光圈层级、"赌"可以用期待的眼神）
-   - 科普内容用温馨的动画符号（气味粒子、情绪云团、光圈等）
-   - 不要出现任何字幕、中文文字、英文文字、小标签、手写体文字、屏幕文字
+## 优先级2：准确表达文案的具体内容
 
-5. **镜头类型参考**
-   - 近景固定镜头、微距特写镜头、中景轻微横移、俯拍镜头、主观视角镜头、特写镜头
+- 如果文案说深夜吃狗粮，就要画{pet_label}起身走到狗盆前吃，不能画睡觉
+- 如果文案说食物分三档，就要用画面展示三种食物的区别（狗粮、掉地上的、手喂的）
+- 如果文案说扔地上吃很快，手喂吃很慢，就要有对比镜头展示速度差异
+- 如果文案说出门前摸头、听脚步声，就要画出门和回家的场景
+
+## 优先级3：避免通用模板
+
+- 不要每段都是抬头-摸头-暖光扩散
+- 要根据文案的具体情节设计画面
+- 每个分镜要有信息变化，不要重复
+
+## 优先级4：画面细节要求
+
+- 用动画化的方式表现抽象概念（如等级观念可以用光圈层级、赌可以用期待的眼神）
+- 科普内容用温馨的动画符号（气味粒子、情绪云团、光圈等）
+- 不要出现任何字幕、中文文字、英文文字、小标签、手写体文字、屏幕文字
+- 镜头类型参考：近景固定镜头、微距特写镜头、中景轻微横移、俯拍镜头、主观视角镜头、特写镜头
+
+## 内化但不输出的规则
+- 开头策略：{hook_strategy}
+- 前3秒：{first_3s_rule}
+- 留存节奏：{retention_structure}
+- 画面密度：{density_rule}
+- 不要在输出中写爆款开头策略、前3秒视觉钩子等标签，只输出可见画面
 
 # 输出格式
-只输出分镜描述，每行一个分镜，格式如下：
+输出 JSON 格式，包含分镜列表和分镜元素：
 
-0-2秒：近景固定镜头，[具体画面描述，必须符合文案内容]
-2-4秒：微距特写镜头，缓慢推近，[具体画面描述]
-...
+{{
+  "subject": "本段核心主体（如：金毛叼着球、柴犬甩头拽玩具）",
+  "action": "本段核心动作（如：叼球不给主人、甩头邀请拽玩具、放球脚边退后）",
+  "scene": "本段核心场景（如：客厅地板、草地、窗边）",
+  "storyboard": [
+    "0-2秒：近景固定镜头，[具体画面描述，必须符合文案内容]",
+    "2-4秒：微距特写镜头，缓慢推近，[具体画面描述]"
+  ]
+}}
 
 要求：
+- subject/action/scene 必须从文案中提取具体内容，不要用日常互动、温馨客厅这类泛化词
 - 每个分镜描述要具体、可执行
 - 必须体现文案的核心情节
 - 不要输出任何解释或说明
-- 直接输出分镜列表
+- 只输出 JSON
 """
 
     try:
@@ -141,24 +203,56 @@ def _call_claude_for_storyboard(
         if not text.strip():
             raise RuntimeError("AI 返回空内容")
 
-        # 解析分镜列表，保留 0-2秒 / 2-4秒 这类时间轴前缀。
+        # 解析 JSON 格式的分镜结果
+        try:
+            # 尝试提取 JSON
+            json_match = re.search(r'\{[\s\S]*\}', text)
+            if json_match:
+                import json
+                data = json.loads(json_match.group(0))
+                subject = str(data.get("subject") or f"{pet_label}日常互动")
+                action = str(data.get("action") or "日常互动")
+                scene = str(data.get("scene") or "温馨客厅")
+                storyboard_raw = data.get("storyboard") or []
+            else:
+                # 兜底：如果不是 JSON，按原来的行解析
+                subject = f"{pet_label}日常互动"
+                action = "日常互动"
+                scene = "温馨客厅"
+                storyboard_raw = [line.strip() for line in text.strip().split('\n') if line.strip()]
+        except (json.JSONDecodeError, AttributeError):
+            # JSON 解析失败，按原来的行解析
+            subject = f"{pet_label}日常互动"
+            action = "日常互动"
+            scene = "温馨客厅"
+            storyboard_raw = [line.strip() for line in text.strip().split('\n') if line.strip()]
+
+        # 清理分镜列表
         storyboard = []
-        for line in text.strip().split('\n'):
+        for line in storyboard_raw:
             line = line.strip()
             if not line:
                 continue
             line = re.sub(r"^\s*[-*•]?\s*\d+[\.、)]\s*", "", line)
             storyboard.append(line)
 
-        return storyboard if storyboard else [f"0-{duration}秒：{pet_label}日常互动，温馨场景"]
+        if storyboard:
+            return storyboard, subject, action, scene
+        else:
+            return ([f"0-{duration}秒：{pet_label}日常互动，温馨场景"], f"{pet_label}", "日常互动", "温馨客厅")
 
     except Exception as exc:
         print(f"⚠️ AI 生成分镜失败，使用默认分镜：{exc}")
-        # 降级方案：返回基础分镜
-        return [
-            f"0-{max(2, min(duration, 2))}秒：{pet_label}在温馨客厅中的日常场景",
-            f"{max(2, min(duration, 2))}-{duration}秒：主人与{pet_label}的温馨互动",
-        ]
+        # 降级方案：返回基础分镜和默认元素
+        return (
+            [
+                f"0-{max(2, min(duration, 2))}秒：{pet_label}在温馨客厅中的日常场景",
+                f"{max(2, min(duration, 2))}-{duration}秒：主人与{pet_label}的温馨互动",
+            ],
+            f"{pet_label}",
+            "日常互动",
+            "温馨客厅"
+        )
 
 
 def generate_video_prompts(
@@ -167,6 +261,7 @@ def generate_video_prompts(
     channel_id: Optional[str] = None,
     scene_continuity: bool = True,
     provider_id: Optional[str] = None,
+    niche: str = "",
 ) -> List[Dict]:
     """
     为每个段落生成视频提示词
@@ -199,12 +294,13 @@ def generate_video_prompts(
         keywords = analyze_keywords(seg["text"], pet_context)
 
         # 使用 AI 生成定制化分镜（理解文案内容）
-        storyboard = _call_claude_for_storyboard(
+        storyboard, subject, action, scene = _call_claude_for_storyboard(
             segment_text=seg["text"],
             duration=int(seg["estimated_duration"]),
             pet_context=pet_context,
             channel_id=channel_id,
             provider_id=provider_id,
+            niche=niche,
         )
 
         print(f"    ✓ 生成了 {len(storyboard)} 个分镜")
@@ -215,9 +311,9 @@ def generate_video_prompts(
             duration=int(seg["estimated_duration"]),
             transcript=seg["text"],
             function=f"段落{seg['index']}",
-            main_action=keywords.get("actions", ["日常互动"])[0] if keywords.get("actions") else "日常互动",
+            main_action=action,  # 使用 AI 提取的动作
             emotion=keywords.get("emotions", ["温馨"])[0] if keywords.get("emotions") else "温馨",
-            scene=keywords.get("scenes", ["温馨客厅"])[0] if keywords.get("scenes") else "温馨客厅",
+            scene=scene,  # 使用 AI 提取的场景
             storyboard=storyboard,
             prompt="",  # 将由 build_prompt_for_segment 生成
         )
@@ -238,7 +334,7 @@ def generate_video_prompts(
             "duration": seg["estimated_duration"],
             "prompt": prompt_text,
             "shot": "",  # Seedance 提示词已包含镜头信息
-            "subject": pet_context.get("pet_label", "宠物"),
+            "subject": subject,  # 使用 AI 提取的主体
             "action": seedance_seg.main_action,
             "scene": seedance_seg.scene,
             "full_content": prompt_text,

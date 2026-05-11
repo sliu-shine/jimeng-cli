@@ -11,6 +11,7 @@ import time
 import re
 import uuid
 import subprocess
+import shutil
 from pathlib import Path
 from typing import Optional
 from datetime import datetime
@@ -45,6 +46,8 @@ ROOT = Path(__file__).resolve().parent
 APP_DIR = ROOT / ".webui"
 DOUYIN_ACCOUNTS_FILE = APP_DIR / "douyin_accounts.json"
 GENERATED_SCRIPTS_FILE = APP_DIR / "generated_scripts.json"
+GENERATED_SCRIPT_PROJECTS_DIR = APP_DIR / "generated-script-projects"
+GENERATED_SCRIPTS_INDEX_FILE = APP_DIR / "generated_scripts_index.json"
 WEB_QUEUE_FILE = APP_DIR / "web.queue.json"
 PROJECTS_DIR = APP_DIR / "projects"
 PROJECTS_INDEX_FILE = APP_DIR / "projects.json"
@@ -415,15 +418,52 @@ def create_web_project(name: str, description: str = "") -> dict:
 
 
 def load_generated_scripts() -> list[dict]:
-    if not GENERATED_SCRIPTS_FILE.exists():
-        return []
-    try:
-        data = json.loads(GENERATED_SCRIPTS_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return []
-    if not isinstance(data, list):
-        return []
-    return [item for item in data if isinstance(item, dict)]
+    records: list[dict] = []
+    seen: set[str] = set()
+
+    if GENERATED_SCRIPT_PROJECTS_DIR.exists():
+        for script_file in sorted(GENERATED_SCRIPT_PROJECTS_DIR.glob("*/generated_scripts.json")):
+            try:
+                data = json.loads(script_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(data, list):
+                continue
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                record_id = str(item.get("id") or "")
+                if record_id and record_id in seen:
+                    continue
+                item = dict(item)
+                item["_storage_path"] = str(script_file)
+                item["_project_dir"] = str(script_file.parent)
+                item["_legacy_global"] = False
+                if record_id:
+                    seen.add(record_id)
+                records.append(item)
+
+    if GENERATED_SCRIPTS_FILE.exists():
+        try:
+            data = json.loads(GENERATED_SCRIPTS_FILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            data = []
+        if isinstance(data, list):
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                record_id = str(item.get("id") or "")
+                if record_id and record_id in seen:
+                    continue
+                item = dict(item)
+                item["_storage_path"] = str(GENERATED_SCRIPTS_FILE)
+                item["_project_dir"] = ""
+                item["_legacy_global"] = True
+                if record_id:
+                    seen.add(record_id)
+                records.append(item)
+
+    return sorted(records, key=lambda item: str(item.get("created_at") or ""), reverse=True)
 
 
 def save_generated_scripts(records: list[dict]) -> None:
@@ -433,13 +473,40 @@ def save_generated_scripts(records: list[dict]) -> None:
     tmp.replace(GENERATED_SCRIPTS_FILE)
 
 
+def generated_script_project_folder_name(topic: str, created_at: datetime, record_id: str) -> str:
+    date_part = created_at.strftime("%Y-%m-%d_%H-%M-%S")
+    clean_topic = sanitize_project_name(str(topic or "").strip())[:36] or "未命名文案"
+    return f"{date_part}-{clean_topic}-{record_id[:8]}"
+
+
+def save_generated_scripts_index(record: dict) -> None:
+    index = load_json(GENERATED_SCRIPTS_INDEX_FILE, {})
+    items = index.get("records") if isinstance(index, dict) else []
+    if not isinstance(items, list):
+        items = []
+    items = [item for item in items if str(item.get("id")) != str(record.get("id"))]
+    items.insert(0, {
+        "id": record.get("id"),
+        "created_at": record.get("created_at"),
+        "topic": record.get("topic"),
+        "niche": record.get("niche"),
+        "project_name": record.get("project_name"),
+        "project_folder": record.get("project_folder"),
+        "script_file": record.get("script_file"),
+    })
+    save_json(GENERATED_SCRIPTS_INDEX_FILE, {"version": 1, "records": items[:500]})
+
+
 def generated_script_choices() -> list[tuple[str, str]]:
     choices = []
     for item in load_generated_scripts():
         created_at = str(item.get("created_at", ""))[:16].replace("T", " ")
         topic = str(item.get("topic") or "未命名主题").strip()
         niche = str(item.get("niche") or "未填赛道").strip()
-        label = f"{created_at} · {topic[:28]} · {niche}"
+        prefix = "旧全局 · " if item.get("_legacy_global") else ""
+        project_name = str(item.get("project_name") or "").strip()
+        project_label = f" · {project_name[:18]}" if project_name else ""
+        label = f"{prefix}{created_at} · {topic[:28]} · {niche}{project_label}"
         choices.append((label, str(item.get("id"))))
     return choices
 
@@ -451,19 +518,49 @@ def save_generated_script_record(
     versions: int,
     content: str,
     metadata: dict | None = None,
+    versions_list: list | None = None,
 ) -> dict:
+    metadata = metadata or {}
+    references = metadata.get("references") or []
+    created_at = datetime.now()
+    record_id = uuid.uuid4().hex
+    project_name = str(topic or "").strip()[:48] or "未命名文案项目"
+    project_folder = generated_script_project_folder_name(project_name, created_at, record_id)
+    project_dir = GENERATED_SCRIPT_PROJECTS_DIR / project_folder
+    script_file = project_dir / "generated_scripts.json"
     record = {
-        "id": uuid.uuid4().hex,
-        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "id": record_id,
+        "created_at": created_at.isoformat(timespec="seconds"),
+        "project_name": project_name,
+        "project_folder": project_folder,
+        "project_dir": str(project_dir),
+        "script_file": str(script_file),
         "topic": str(topic or "").strip(),
         "niche": str(niche or "").strip(),
         "requirements": str(requirements or "").strip(),
         "versions": int(versions or 1),
         "content": str(content or "").strip(),
-        "metadata": metadata or {},
+        "versions_list": versions_list or [],
+        "reference_ids": [str(item.get("video_id") or "") for item in references if item.get("video_id")],
+        "reference_summary": [
+            {
+                "rank": item.get("rank"),
+                "video_id": item.get("video_id"),
+                "source": item.get("source"),
+                "likes": item.get("likes"),
+                "similarity": item.get("similarity"),
+                "rank_score": item.get("rank_score"),
+                "hook_type": item.get("hook_type"),
+                "structure": item.get("structure"),
+            }
+            for item in references
+        ],
+        "strategy": metadata.get("strategy") or {},
+        "metadata": metadata,
     }
-    records = [record] + load_generated_scripts()
-    save_generated_scripts(records[:200])
+    project_dir.mkdir(parents=True, exist_ok=True)
+    save_json(script_file, [record])
+    save_generated_scripts_index(record)
     return record
 
 
@@ -474,32 +571,106 @@ def refresh_generated_scripts():
     return gr.update(choices=choices, value=value), status
 
 
+def switch_version(versions_list: list, index: int):
+    """切换到指定版本（index 从1开始）"""
+    if not versions_list or index < 1 or index > len(versions_list):
+        return (
+            gr.update(),
+            f"版本{index} 不存在（共 {len(versions_list)} 个版本）",
+            "", "", "", "", "",
+        )
+    item = versions_list[index - 1]
+    content = str(item.get("content") or "").strip()
+    score = item.get("score") or 0
+    passed = "✅ 通过" if item.get("passed") else "⚠️ 需优化"
+    title = str(item.get("title") or "")
+    description = str(item.get("description") or "")
+    tags = " ".join([f"#{tag}" for tag in item.get("tags") or []])
+    cover_image = str(item.get("cover_image") or "")
+    cover_text = str(item.get("cover_text") or "")
+    return (
+        content,
+        f"当前：版本{index} · {score}分 · {passed}",
+        title,
+        description,
+        tags,
+        cover_image,
+        cover_text,
+    )
+
+
 def load_saved_generated_script(script_id: str):
     for item in load_generated_scripts():
         if str(item.get("id")) == str(script_id):
-            content = str(item.get("content") or "")
-            display_content = content + format_generation_report(item.get("metadata"))
+            versions_list = item.get("versions_list") or []
+            if versions_list:
+                first_version = versions_list[0]
+                script_text = str(first_version.get("content") or "").strip()
+                title = str(first_version.get("title") or "")
+                description = str(first_version.get("description") or "")
+                tags = " ".join([f"#{tag}" for tag in first_version.get("tags") or []])
+                cover_image = str(first_version.get("cover_image") or "")
+                cover_text = str(first_version.get("cover_text") or "")
+            else:
+                script_text = str(item.get("content") or "").strip()
+                title = description = tags = cover_image = cover_text = ""
+            display_content = str(item.get("content") or "") + format_generation_report(item.get("metadata"))
             status = f"已载入：{item.get('topic') or '未命名主题'}"
+            if item.get("_storage_path"):
+                status += f"\n\n文件：`{item.get('_storage_path')}`"
+            n = len(versions_list)
+            ver_status = f"共 {n} 个版本，当前：版本1" if n > 0 else "（旧格式，无版本拆分）"
             return (
                 display_content,
-                content,
+                script_text,
                 item.get("topic", ""),
                 item.get("niche", ""),
                 item.get("requirements", ""),
                 int(item.get("versions") or 1),
                 status,
+                versions_list,
+                ver_status,
+                title,
+                description,
+                tags,
+                cover_image,
+                cover_text,
             )
-    return "", "", gr.update(), gr.update(), gr.update(), gr.update(), "未找到这条保存记录。"
+    return "", "", gr.update(), gr.update(), gr.update(), gr.update(), "未找到这条保存记录。", [], "", "", "", "", "", ""
 
 
 def delete_saved_generated_script(script_id: str):
-    records = load_generated_scripts()
-    kept = [item for item in records if str(item.get("id")) != str(script_id)]
-    if len(kept) != len(records):
-        save_generated_scripts(kept)
+    deleted = False
+    for item in load_generated_scripts():
+        if str(item.get("id")) != str(script_id):
+            continue
+        storage_path = Path(str(item.get("_storage_path") or ""))
+        if item.get("_legacy_global"):
+            legacy_records = []
+            if GENERATED_SCRIPTS_FILE.exists():
+                try:
+                    data = json.loads(GENERATED_SCRIPTS_FILE.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    data = []
+                if isinstance(data, list):
+                    legacy_records = [
+                        row for row in data
+                        if isinstance(row, dict) and str(row.get("id")) != str(script_id)
+                    ]
+            save_generated_scripts(legacy_records)
+            deleted = True
+        elif storage_path.name == "generated_scripts.json" and storage_path.parent.exists():
+            shutil.rmtree(storage_path.parent)
+            index = load_json(GENERATED_SCRIPTS_INDEX_FILE, {})
+            items = index.get("records") if isinstance(index, dict) else []
+            if isinstance(items, list):
+                items = [row for row in items if str(row.get("id")) != str(script_id)]
+                save_json(GENERATED_SCRIPTS_INDEX_FILE, {"version": 1, "records": items})
+            deleted = True
+        break
     choices = generated_script_choices()
     value = choices[0][1] if choices else None
-    status = "已删除。" if len(kept) != len(records) else "未找到可删除的记录。"
+    status = "已删除。" if deleted else "未找到可删除的记录。"
     return gr.update(choices=choices, value=value), "", "", status
 
 
@@ -795,22 +966,27 @@ def run_generate(
 ):
     set_env(api_key, base_url, model, provider_id)
     if not topic.strip():
-        yield "❌ 请输入视频主题", gr.update(), "未保存：缺少视频主题。", gr.update(), gr.update()
+        yield "❌ 请输入视频主题", gr.update(), "未保存：缺少视频主题。", gr.update(), gr.update(), [], ""
         return
-    yield "⏳ 智能体运行中，正在检索爆款知识库并生成文案...", gr.update(), "", gr.update(), gr.update()
+    yield "⏳ 智能体运行中，正在检索爆款知识库、生成文案并逐版本 AI 质检...", gr.update(), "", gr.update(), gr.update(), [], ""
     generation = generate_detailed(topic=topic, niche=niche, requirements=requirements, versions=int(versions))
     result = generation["content"]
     metadata = generation.get("metadata") or {}
     report_markdown = generation.get("report_markdown") or format_generation_report(metadata)
     display_result = result + report_markdown
-    record = save_generated_script_record(topic, niche, requirements, int(versions), result, metadata)
-    status = f"✅ 已自动保存到 {GENERATED_SCRIPTS_FILE} · ID {record['id'][:8]}"
+    vlist = generation.get("versions_list") or []
+    record = save_generated_script_record(topic, niche, requirements, int(versions), result, metadata, vlist)
+    status = f"✅ 已自动保存到 {record.get('script_file')} · ID {record['id'][:8]}"
+    n = len(vlist)
+    ver_status = f"共 {n} 个版本，当前：版本1" if n > 0 else ""
     yield (
         display_result,
         gr.update(choices=generated_script_choices(), value=record["id"]),
         status,
         _first_generated_version(result),
         "已自动载入最新生成文案，可直接拆分即梦提示词。",
+        vlist,
+        ver_status,
     )
 
 
@@ -1614,7 +1790,14 @@ def import_selected_transcripts(
                 analysis=analysis,
                 metadata={
                     "source": "douyin_webui",
+                    "views": metadata.get("views", metadata.get("play_count", metadata.get("plays", 0))),
                     "likes": likes,
+                    "comments": metadata.get("comments", metadata.get("comment_count", 0)),
+                    "shares": metadata.get("shares", metadata.get("share_count", 0)),
+                    "favorites": metadata.get("favorites", metadata.get("collects", metadata.get("collect_count", 0))),
+                    "completion_rate": metadata.get("completion_rate", metadata.get("finish_rate", "")),
+                    "publish_time": metadata.get("publish_time", metadata.get("published_at", metadata.get("create_time", ""))),
+                    "account_type": metadata.get("account_type", ""),
                     "engagement_level": level,
                     "niche": channel,
                     "channel": channel,
@@ -2587,11 +2770,29 @@ with gr.Blocks(title="爆款文案智能体") as demo:
                     delete_saved_btn = gr.Button("删除", scale=1)
 
                 saved_status = gr.Markdown(value=f"已保存 {len(generated_script_choices())} 条文案。")
+
+                versions_list_state = gr.State([])
+
+                with gr.Row():
+                    ver_btn_1 = gr.Button("版本1", size="sm", scale=1)
+                    ver_btn_2 = gr.Button("版本2", size="sm", scale=1)
+                    ver_btn_3 = gr.Button("版本3", size="sm", scale=1)
+                    ver_btn_4 = gr.Button("版本4", size="sm", scale=1)
+                    ver_btn_5 = gr.Button("版本5", size="sm", scale=1)
+                    ver_label = gr.Textbox(value="← 载入文案后点击切换版本", interactive=False, show_label=False, scale=3)
+
                 saved_script_text = gr.Textbox(
-                    label="当前文案（可编辑；默认载入第一个版本，想拆别的版本可手动粘贴）",
+                    label="当前文案正文（可编辑）",
                     lines=10,
                     placeholder="生成或载入文案后，这里会出现可继续加工的文案。",
                 )
+
+                with gr.Accordion("📋 结构化字段", open=False):
+                    ver_title = gr.Textbox(label="标题", lines=1, interactive=False)
+                    ver_description = gr.Textbox(label="描述", lines=8, interactive=False)
+                    ver_tags = gr.Textbox(label="标签", lines=1, interactive=False)
+                    ver_cover_image = gr.Textbox(label="封面图建议", lines=3, interactive=False)
+                    ver_cover_text = gr.Textbox(label="封面文字建议", lines=1, interactive=False)
 
                 with gr.Row():
                     dreamina_max_seconds = gr.Slider(
@@ -2655,8 +2856,21 @@ with gr.Blocks(title="爆款文案智能体") as demo:
                         req_input,
                         versions_input,
                         saved_status,
+                        versions_list_state,
+                        ver_label,
+                        ver_title,
+                        ver_description,
+                        ver_tags,
+                        ver_cover_image,
+                        ver_cover_text,
                     ],
                 )
+                for _ver_idx, _ver_btn in enumerate([ver_btn_1, ver_btn_2, ver_btn_3, ver_btn_4, ver_btn_5], start=1):
+                    _ver_btn.click(
+                        fn=lambda vl, idx=_ver_idx: switch_version(vl, idx),
+                        inputs=[versions_list_state],
+                        outputs=[saved_script_text, ver_label, ver_title, ver_description, ver_tags, ver_cover_image, ver_cover_text],
+                    )
                 delete_saved_btn.click(
                     delete_saved_generated_script,
                     inputs=[gen_saved_dropdown],
@@ -2781,7 +2995,7 @@ python sora_queue.py /path/to/sora_queue.json --output-dir /path/to/outputs
             gen_btn.click(
                 run_generate,
                 inputs=[topic_input, niche_input3, req_input, versions_input, api_key_input, base_url_input, model_input, provider_input],
-                outputs=[gen_output, gen_saved_dropdown, gen_save_status, saved_script_text, saved_status],
+                outputs=[gen_output, gen_saved_dropdown, gen_save_status, saved_script_text, saved_status, versions_list_state, ver_label],
             )
 
         with gr.Tab("🎯 智能分段+提示词"):
