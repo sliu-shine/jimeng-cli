@@ -25,7 +25,6 @@ from viral_agent.analyzer import _call_claude, analyze_script, engagement_level
 from viral_agent.agent import format_generation_report, generate_detailed
 from viral_agent.ai_providers import apply_provider, get_provider, masked_key, provider_choices
 from viral_agent.seedance_prompt_builder import build_seedance_outputs, get_channel_choices, get_default_channel_id
-from viral_agent.sora_prompt_builder import build_sora_outputs
 from viral_agent.text_segmenter import (
     segment_by_sentences,
     format_segments_for_display,
@@ -38,6 +37,9 @@ from viral_agent.prompt_agent import (
     prompts_to_table_data,
     export_to_seedance_queue,
 )
+from viral_agent.feedback import add_video_feedback, build_learning_context, get_generation, list_generations, record_generation
+from viral_agent.feedback.analyzer import analyze_single_video, format_review_markdown
+from viral_agent.feedback.tracker import get_latest_feedback
 from douyin.douyin_downloader.pipeline import DouyinViralPipeline
 from douyin.douyin_downloader.transcriber import extract_transcript
 from scripts.claude_client import ClaudeClient
@@ -748,38 +750,6 @@ def build_dreamina_prompts(script: str, max_seconds: int, model_version: str, ch
     return build_seedance_outputs(script, model_version=model_version or "seedance2.0fast", channel_id=channel_id or None)
 
 
-def build_sora_prompts(script: str):
-    """构建 Sora 提示词"""
-    return build_sora_outputs(script)
-
-
-def save_sora_queue_to_file(queue_json: str, file_path: str) -> str:
-    """保存 Sora 队列到文件"""
-    if not queue_json or not queue_json.strip():
-        return "❌ 队列 JSON 为空，请先点击「拆分为 Sora 2.0 视频提示词」。"
-
-    if not file_path or not file_path.strip():
-        return "❌ 请输入保存路径。"
-
-    try:
-        # 验证 JSON 格式
-        json.loads(queue_json)
-
-        # 保存文件
-        output_path = Path(file_path.strip())
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write(queue_json)
-
-        return f"✅ 队列已保存到: {output_path}\n\n执行命令：\n```bash\npython sora_queue.py {output_path}\n```"
-
-    except json.JSONDecodeError as e:
-        return f"❌ JSON 格式错误: {e}"
-    except Exception as e:
-        return f"❌ 保存失败: {e}"
-
-
 def refresh_project_choices():
     choices = project_choices()
     value = active_project_id() or (choices[0][1] if choices else None)
@@ -988,6 +958,240 @@ def run_generate(
         vlist,
         ver_status,
     )
+
+
+# ── 反馈学习 ──────────────────────────────────────────────
+def feedback_generation_choices() -> list[tuple[str, str]]:
+    choices = []
+    for item in list_generations(limit=100):
+        created_at = str(item.get("generated_at") or "")[:16].replace("T", " ")
+        niche = str(item.get("niche") or "未填赛道")
+        topic = str(item.get("topic") or "未命名主题")
+        label = f"{created_at} · {niche} · {topic[:36]} · {item['id']}"
+        choices.append((label, str(item["id"])))
+    return choices
+
+
+def refresh_feedback_generations():
+    choices = feedback_generation_choices()
+    value = choices[0][1] if choices else None
+    status = f"已找到 {len(choices)} 条生成记录。" if choices else "还没有生成记录。先在「生成文案」页生成一条。"
+    return gr.update(choices=choices, value=value), status
+
+
+def _feedback_percent_value(value):
+    if value in (None, ""):
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return round(numeric * 100, 4) if 0 < numeric <= 1 else numeric
+
+
+def _empty_feedback_form_values():
+    return (
+        "",
+        "douyin",
+        "",
+        "",
+        None,
+        0,
+        0,
+        0,
+        0,
+        0,
+        None,
+        None,
+        None,
+        None,
+        None,
+        "",
+    )
+
+
+def _feedback_form_values(feedback: dict):
+    if not feedback:
+        return _empty_feedback_form_values()
+    return (
+        str(feedback.get("video_id") or ""),
+        str(feedback.get("platform") or "douyin"),
+        str(feedback.get("title") or ""),
+        str(feedback.get("published_at") or ""),
+        feedback.get("duration_seconds"),
+        int(feedback.get("views") or 0),
+        int(feedback.get("likes") or 0),
+        int(feedback.get("comments") or 0),
+        int(feedback.get("favorites") or 0),
+        int(feedback.get("shares") or 0),
+        _feedback_percent_value(feedback.get("completion_rate")),
+        _feedback_percent_value(feedback.get("bounce_2s_rate")),
+        _feedback_percent_value(feedback.get("completion_5s_rate")),
+        feedback.get("avg_watch_seconds"),
+        _feedback_percent_value(feedback.get("avg_watch_ratio")),
+        str(feedback.get("notes") or ""),
+    )
+
+
+def load_feedback_generation(generation_id: str):
+    if not generation_id:
+        return ("请选择一条生成记录。", "", "", *_empty_feedback_form_values())
+    item = get_generation(generation_id)
+    if not item:
+        return (f"未找到生成记录：`{generation_id}`", "", "", *_empty_feedback_form_values())
+    script = str(item.get("script") or "")
+    preview = script[:1200] + ("..." if len(script) > 1200 else "")
+    latest_feedback = get_latest_feedback(generation_id)
+    info = [
+        f"### 生成记录 `{generation_id}`",
+        f"- **生成时间：** {item.get('generated_at') or ''}",
+        f"- **赛道：** {item.get('niche') or '未填'}",
+        f"- **选题：** {item.get('topic') or '未填'}",
+        f"- **Hook类型：** {item.get('hook_type') or '未提取'}",
+        f"- **结构：** {item.get('structure') or '未提取'}",
+        "",
+        (
+            f"✅ **已载入最新发布数据：** feedback_id={latest_feedback.get('id')}，"
+            f"录入时间 {latest_feedback.get('created_at') or ''}"
+        ) if latest_feedback else "ℹ️ **暂无发布数据：** 右侧录入后可保存并复盘。",
+        "",
+        "#### 文案预览",
+        preview,
+    ]
+    return (
+        "\n".join(info),
+        str(item.get("topic") or ""),
+        str(item.get("niche") or ""),
+        *_feedback_form_values(latest_feedback),
+    )
+
+
+def create_historical_generation(
+    topic: str,
+    niche: str,
+    script: str,
+    hook_type: str,
+    structure: str,
+    emotion_direction: str,
+    notes: str,
+):
+    topic = str(topic or "").strip()
+    niche = str(niche or "").strip()
+    script = str(script or "").strip()
+    if not topic:
+        return gr.update(), "❌ 请填写历史视频的选题/标题。", "尚未载入生成记录。", "", "", *_empty_feedback_form_values()
+    if not script:
+        return gr.update(), "❌ 请粘贴历史视频的原始文案。", "尚未载入生成记录。", "", "", *_empty_feedback_form_values()
+    generation_id = record_generation(
+        script=script,
+        topic=topic,
+        niche=niche,
+        hook_type=str(hook_type or "").strip(),
+        structure=str(structure or "").strip(),
+        emotion_direction=str(emotion_direction or "").strip(),
+        generation_params={"source": "historical_manual_import"},
+        metadata={"manual_notes": str(notes or "").strip(), "source": "historical_video"},
+        source_record_id="historical_manual_import",
+    )
+    choices = feedback_generation_choices()
+    loaded = load_feedback_generation(generation_id)
+    status = f"✅ 已补录历史视频记录：`{generation_id}`。现在可以在右侧填写发布数据并复盘。"
+    return gr.update(choices=choices, value=generation_id), status, *loaded
+
+
+def submit_feedback_and_analyze(
+    generation_id: str,
+    video_id: str,
+    platform: str,
+    title: str,
+    published_at: str,
+    duration_seconds,
+    views,
+    likes,
+    comments,
+    favorites,
+    shares,
+    completion_rate,
+    bounce_2s_rate,
+    completion_5s_rate,
+    avg_watch_seconds,
+    avg_watch_ratio,
+    notes: str,
+    api_key: str,
+    base_url: str,
+    model: str,
+    provider_id: str,
+):
+    if not generation_id:
+        yield "❌ 请先选择生成记录。", "", ""
+        return
+    yield "⏳ 已收到点击，正在保存反馈数据...", "### 复盘准备中\n\n正在写入这条视频的运营数据。", ""
+    try:
+        set_env(api_key, base_url, model, provider_id)
+        feedback_id = add_video_feedback(
+            generation_id=generation_id,
+            video_id=str(video_id or "").strip(),
+            platform=str(platform or "douyin").strip() or "douyin",
+            title=str(title or "").strip(),
+            published_at=str(published_at or "").strip(),
+            duration_seconds=float(duration_seconds) if duration_seconds not in (None, "") else None,
+            views=int(views or 0),
+            likes=int(likes or 0),
+            comments=int(comments or 0),
+            favorites=int(favorites or 0),
+            shares=int(shares or 0),
+            completion_rate=float(completion_rate) if completion_rate not in (None, "") else None,
+            bounce_2s_rate=float(bounce_2s_rate) if bounce_2s_rate not in (None, "") else None,
+            completion_5s_rate=float(completion_5s_rate) if completion_5s_rate not in (None, "") else None,
+            avg_watch_seconds=float(avg_watch_seconds) if avg_watch_seconds not in (None, "") else None,
+            avg_watch_ratio=float(avg_watch_ratio) if avg_watch_ratio not in (None, "") else None,
+            notes=str(notes or "").strip(),
+        )
+        provider_label = str(provider_id or os.environ.get("AI_PROVIDER_SELECTED") or os.environ.get("AI_PROVIDER_DEFAULT") or "默认Provider")
+        yield (
+            f"✅ 已保存反馈：feedback_id={feedback_id}\n\n⏳ 正在调用AI模型复盘（{provider_label}），这一步可能需要10-60秒...",
+            "### AI复盘进行中\n\n已保存数据，正在把原始文案、运营数据、人工备注和规则诊断一起交给模型分析。",
+            "",
+        )
+        review = analyze_single_video(generation_id, feedback_id=feedback_id, use_ai=True, provider_id=provider_id)
+        generation = get_generation(generation_id)
+        context = build_learning_context(niche=str(generation.get("niche") or ""), limit=10)
+        context_md = format_learning_context_markdown(context)
+        mode = "AI模型复盘" if review.get("ai_model_used") else "规则复盘"
+        status = f"✅ 已录入反馈并完成{mode}：feedback_id={feedback_id}，review_id={review.get('review_id')}"
+        if review.get("ai_model_error"):
+            status += f"\n\n⚠️ AI模型调用未成功，已保留规则复盘：{review['ai_model_error']}"
+        yield status, format_review_markdown(review), context_md
+    except Exception as exc:
+        yield f"❌ 反馈复盘失败：{exc}", "", ""
+
+
+def format_learning_context_markdown(context: dict) -> str:
+    lines = [
+        "## 最近反馈学习上下文",
+        f"- **样本数：** {context.get('sample_size', 0)}",
+        f"- **赛道：** {context.get('niche') or '全部'}",
+        f"- **结果分布：** {context.get('result_levels') or {}}",
+    ]
+    if context.get("avg_like_rate") is not None:
+        lines.append(f"- **平均点赞率：** {context['avg_like_rate'] * 100:.2f}%")
+    if context.get("avg_completion_rate") is not None:
+        lines.append(f"- **平均完播率：** {context['avg_completion_rate'] * 100:.2f}%")
+    sections = [
+        ("must_use", "下次必须强化"),
+        ("prefer", "优先使用"),
+        ("avoid", "避免复用"),
+        ("experiment", "可测试方向"),
+    ]
+    for key, title in sections:
+        values = context.get(key) or []
+        lines.append(f"\n### {title}")
+        lines.extend([f"- {item}" for item in values] or ["- 暂无"])
+    return "\n".join(lines)
+
+
+def refresh_feedback_context(niche: str, limit: int):
+    return format_learning_context_markdown(build_learning_context(niche=str(niche or "").strip(), limit=int(limit or 10)))
 
 
 # ── 旧版采集流水线辅助 ────────────────────────────────────
@@ -2896,107 +3100,176 @@ with gr.Blocks(title="爆款文案智能体") as demo:
                     outputs=[seedance_project_dropdown, seedance_import_status],
                 )
 
-        with gr.Tab("🎥 Sora 视频生成"):
+        with gr.Tab("🧠 反馈学习"):
             gr.Markdown("""
-## Sora 2.0 视频生成（云雾 API）
+## 发布后反馈学习
 
-使用云雾 API 的 sora-2-all 模型生成高质量真实感视频。
-
-**特点：**
-- 真实感视频风格（与 Seedance 的动画风格不同）
-- 支持 5-20 秒视频片段
-- 电影级画面质感
-
-**使用前准备：**
-1. 设置环境变量 `YUNWU_API_KEY`（云雾 API 密钥）
-2. 可选设置 `YUNWU_BASE_URL`（默认：https://api.yunwu.ai）
-""")
+把视频发布后的真实数据录进来，AI会生成单条复盘，并把结论沉淀成下一次生成文案时会读取的策略约束。
+            """)
 
             with gr.Row():
-                with gr.Column(scale=2):
-                    sora_gen_saved_dropdown = gr.Dropdown(
-                        label="已保存的文案",
-                        choices=generated_script_choices(),
+                with gr.Column(scale=1):
+                    feedback_generation_dropdown = gr.Dropdown(
+                        label="选择生成记录",
+                        choices=feedback_generation_choices(),
                         interactive=True,
-                        scale=3,
                     )
-                sora_refresh_saved_btn = gr.Button("刷新列表", scale=1)
-                sora_load_saved_btn = gr.Button("载入", variant="primary", scale=1)
+                    with gr.Row():
+                        feedback_refresh_btn = gr.Button("刷新生成记录", variant="secondary")
+                        feedback_load_btn = gr.Button("载入记录", variant="primary")
+                    feedback_status = gr.Markdown(value="选择一条生成记录后录入发布数据。")
+                    feedback_generation_info = gr.Markdown(value="尚未载入生成记录。")
 
-            sora_saved_status = gr.Markdown(value=f"已保存 {len(generated_script_choices())} 条文案。")
-            sora_script_text = gr.Textbox(
-                label="当前文案（可编辑）",
-                lines=10,
-                placeholder="生成或载入文案后，这里会出现可继续加工的文案。",
-            )
+                    with gr.Accordion("➕ 补录历史视频", open=False):
+                        gr.Markdown("以前发过、但没有 `generation_id` 的视频，在这里先补一条历史记录。")
+                        history_topic = gr.Textbox(label="视频标题/选题 *", placeholder="例如：狗狗克制自己的需求，用陪伴和守护表达爱")
+                        history_niche = gr.Textbox(label="赛道", placeholder="宠物、情感、干货...")
+                        history_script = gr.Textbox(
+                            label="原始文案 *",
+                            placeholder="粘贴这条已发布视频的口播文案/脚本",
+                            lines=8,
+                        )
+                        with gr.Row():
+                            history_hook_type = gr.Textbox(label="Hook类型（可选）", placeholder="反常识/痛点/故事/数据对比")
+                            history_structure = gr.Textbox(label="文案结构（可选）", placeholder="钩子→冲突→解释→行动")
+                        history_emotion = gr.Textbox(label="情绪方向（可选）", placeholder="共鸣、治愈、争议、焦虑、爽感")
+                        history_notes = gr.Textbox(label="备注（可选）", placeholder="封面、画面、发布时间、是否热点等", lines=2)
+                        history_create_btn = gr.Button("创建历史记录", variant="secondary")
 
-            sora_split_btn = gr.Button("🎥 拆分为 Sora 2.0 视频提示词", variant="primary")
+                    feedback_topic_hidden = gr.Textbox(visible=False)
+                    feedback_niche_hidden = gr.Textbox(visible=False)
 
-            sora_prompts_output = gr.Markdown(label="Sora 2.0 提示词")
-            sora_queue_json = gr.Textbox(
-                label="Sora 队列 JSON（可保存后使用 sora_queue.py 执行）",
-                lines=8,
-            )
+                with gr.Column(scale=1):
+                    gr.Markdown("### 发布数据")
+                    with gr.Row():
+                        feedback_video_id = gr.Textbox(label="视频ID（可选）", placeholder="平台视频ID")
+                        feedback_platform = gr.Textbox(label="平台", value="douyin")
+                    feedback_title = gr.Textbox(label="视频标题（可选）", placeholder="发布标题")
+                    feedback_published_at = gr.Textbox(label="发布时间（可选）", placeholder="2026-05-11 20:00")
+                    with gr.Row():
+                        feedback_duration = gr.Number(label="视频时长(秒)", precision=2)
+                        feedback_views = gr.Number(label="播放量", value=0, precision=0)
+                    with gr.Row():
+                        feedback_likes = gr.Number(label="点赞", value=0, precision=0)
+                        feedback_comments = gr.Number(label="评论", value=0, precision=0)
+                    with gr.Row():
+                        feedback_favorites = gr.Number(label="收藏", value=0, precision=0)
+                        feedback_shares = gr.Number(label="分享", value=0, precision=0)
+                    with gr.Row():
+                        feedback_completion_rate = gr.Number(label="完播率(%)", precision=2)
+                        feedback_bounce_2s_rate = gr.Number(label="2s跳出率(%)", precision=2)
+                    with gr.Row():
+                        feedback_completion_5s_rate = gr.Number(label="5s完播率(%)", precision=2)
+                        feedback_avg_watch_seconds = gr.Number(label="平均播放时长(秒)", precision=2)
+                    feedback_avg_watch_ratio = gr.Number(label="平均播放占比(%)", precision=2)
+                    feedback_notes = gr.Textbox(
+                        label="人工备注",
+                        placeholder="封面/画面/配音/热点/投流/评论区典型反馈等",
+                        lines=3,
+                    )
+                    feedback_submit_btn = gr.Button("保存反馈并AI复盘", variant="primary", size="lg")
 
             with gr.Row():
-                sora_save_queue_btn = gr.Button("💾 保存队列到文件", variant="secondary")
-                sora_queue_file_path = gr.Textbox(
-                    label="保存路径",
-                    placeholder="例如：/path/to/sora_queue.json",
-                    scale=3,
-                )
-            sora_save_status = gr.Markdown()
+                with gr.Column(scale=1):
+                    feedback_review_output = gr.Markdown(label="单条视频复盘")
+                with gr.Column(scale=1):
+                    with gr.Row():
+                        feedback_context_niche = gr.Textbox(label="查看赛道", placeholder="留空查看全部")
+                        feedback_context_limit = gr.Slider(label="样本数", minimum=1, maximum=30, value=10, step=1)
+                    feedback_context_btn = gr.Button("刷新学习上下文", variant="secondary")
+                    feedback_context_output = gr.Markdown(label="最近学习上下文")
 
-            gr.Markdown("""
-### 执行队列
+            feedback_load_outputs = [
+                feedback_generation_info,
+                feedback_topic_hidden,
+                feedback_niche_hidden,
+                feedback_video_id,
+                feedback_platform,
+                feedback_title,
+                feedback_published_at,
+                feedback_duration,
+                feedback_views,
+                feedback_likes,
+                feedback_comments,
+                feedback_favorites,
+                feedback_shares,
+                feedback_completion_rate,
+                feedback_bounce_2s_rate,
+                feedback_completion_5s_rate,
+                feedback_avg_watch_seconds,
+                feedback_avg_watch_ratio,
+                feedback_notes,
+            ]
 
-保存队列文件后，在命令行执行：
-
-```bash
-python sora_queue.py /path/to/sora_queue.json
-```
-
-或指定输出目录：
-
-```bash
-python sora_queue.py /path/to/sora_queue.json --output-dir /path/to/outputs
-```
-""")
-
-            # 事件绑定
-            sora_refresh_saved_btn.click(
-                refresh_generated_scripts,
-                outputs=[sora_gen_saved_dropdown, sora_saved_status],
+            feedback_refresh_btn.click(
+                refresh_feedback_generations,
+                outputs=[feedback_generation_dropdown, feedback_status],
             )
-            sora_load_saved_btn.click(
-                load_saved_generated_script,
-                inputs=[sora_gen_saved_dropdown],
+            feedback_load_btn.click(
+                load_feedback_generation,
+                inputs=[feedback_generation_dropdown],
+                outputs=feedback_load_outputs,
+            )
+            feedback_generation_dropdown.change(
+                load_feedback_generation,
+                inputs=[feedback_generation_dropdown],
+                outputs=feedback_load_outputs,
+            )
+            history_create_btn.click(
+                create_historical_generation,
+                inputs=[
+                    history_topic,
+                    history_niche,
+                    history_script,
+                    history_hook_type,
+                    history_structure,
+                    history_emotion,
+                    history_notes,
+                ],
                 outputs=[
-                    gr.Textbox(visible=False),  # gen_output placeholder
-                    sora_script_text,
-                    gr.Textbox(visible=False),  # topic_input placeholder
-                    gr.Textbox(visible=False),  # niche_input3 placeholder
-                    gr.Textbox(visible=False),  # req_input placeholder
-                    gr.Number(visible=False),   # versions_input placeholder
-                    sora_saved_status,
+                    feedback_generation_dropdown,
+                    feedback_status,
+                    *feedback_load_outputs,
                 ],
             )
-            sora_split_btn.click(
-                build_sora_prompts,
-                inputs=[sora_script_text],
-                outputs=[sora_prompts_output, sora_queue_json],
+            feedback_submit_btn.click(
+                submit_feedback_and_analyze,
+                inputs=[
+                    feedback_generation_dropdown,
+                    feedback_video_id,
+                    feedback_platform,
+                    feedback_title,
+                    feedback_published_at,
+                    feedback_duration,
+                    feedback_views,
+                    feedback_likes,
+                    feedback_comments,
+                    feedback_favorites,
+                    feedback_shares,
+                    feedback_completion_rate,
+                    feedback_bounce_2s_rate,
+                    feedback_completion_5s_rate,
+                    feedback_avg_watch_seconds,
+                    feedback_avg_watch_ratio,
+                    feedback_notes,
+                    api_key_input,
+                    base_url_input,
+                    model_input,
+                    provider_input,
+                ],
+                outputs=[feedback_status, feedback_review_output, feedback_context_output],
             )
-            sora_save_queue_btn.click(
-                lambda queue_json, file_path: save_sora_queue_to_file(queue_json, file_path),
-                inputs=[sora_queue_json, sora_queue_file_path],
-                outputs=[sora_save_status],
+            feedback_context_btn.click(
+                refresh_feedback_context,
+                inputs=[feedback_context_niche, feedback_context_limit],
+                outputs=[feedback_context_output],
             )
 
-            gen_btn.click(
-                run_generate,
-                inputs=[topic_input, niche_input3, req_input, versions_input, api_key_input, base_url_input, model_input, provider_input],
-                outputs=[gen_output, gen_saved_dropdown, gen_save_status, saved_script_text, saved_status, versions_list_state, ver_label],
-            )
+        gen_btn.click(
+            run_generate,
+            inputs=[topic_input, niche_input3, req_input, versions_input, api_key_input, base_url_input, model_input, provider_input],
+            outputs=[gen_output, gen_saved_dropdown, gen_save_status, saved_script_text, saved_status, versions_list_state, ver_label],
+        )
 
         with gr.Tab("🎯 智能分段+提示词"):
             gr.Markdown("""
@@ -3372,7 +3645,8 @@ if __name__ == "__main__":
     # 禁用 Gradio 分析和启动事件检查
     os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
     os.environ["GRADIO_SERVER_NAME"] = "127.0.0.1"
-    os.environ["GRADIO_SERVER_PORT"] = "7860"
+    server_port = int(os.environ.get("GRADIO_SERVER_PORT", "7860"))
+    os.environ["GRADIO_SERVER_PORT"] = str(server_port)
 
     # 禁用 httpx 代理（解决 502 问题）
     os.environ["NO_PROXY"] = "localhost,127.0.0.1"
@@ -3382,7 +3656,7 @@ if __name__ == "__main__":
         # 使用最简单的启动方式
         demo.launch(
             server_name="127.0.0.1",
-            server_port=7860,
+            server_port=server_port,
             share=False,
             inbrowser=False
         )
@@ -3394,6 +3668,6 @@ if __name__ == "__main__":
         import uvicorn
 
         app = routes.App.create_app(demo)
-        print("\n✅ 服务器已启动: http://127.0.0.1:7860")
+        print(f"\n✅ 服务器已启动: http://127.0.0.1:{server_port}")
         print("请在浏览器中打开上述地址\n")
-        uvicorn.run(app, host="127.0.0.1", port=7860, log_level="info")
+        uvicorn.run(app, host="127.0.0.1", port=server_port, log_level="info")

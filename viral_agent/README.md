@@ -37,6 +37,20 @@ python -m viral_agent generate --topic "普通人如何月入过万" --niche 干
 
 # 查看知识库状态
 python -m viral_agent stats
+
+# 查看最近生成记录，拿到 generation_id
+python -m viral_agent feedback list
+
+# 手动录入发布后数据，并立即复盘
+python -m viral_agent feedback add \
+  --generation-id gen_xxx \
+  --views 1011 --likes 27 --comments 0 --favorites 4 \
+  --completion-rate 11.01 --bounce-2s-rate 29.9 \
+  --completion-5s-rate 48.72 --avg-watch-seconds 23 \
+  --avg-watch-ratio 26.25 --analyze
+
+# 查看最近复盘沉淀出的生成约束
+python -m viral_agent feedback context --niche 宠物
 ```
 
 ---
@@ -49,6 +63,7 @@ viral_agent/
 ├── transcriber.py      # 视频音频转文字（Whisper / Groq ASR）
 ├── analyzer.py         # Claude 爆款模式分析
 ├── agent.py            # 文案生成主逻辑
+├── feedback/           # 发布后反馈学习 MVP
 ├── pipeline.py         # 数据导入管道
 └── __main__.py         # CLI 入口
 

@@ -72,7 +72,9 @@ def _call_claude_for_storyboard(
     channel_id: Optional[str] = None,
     provider_id: Optional[str] = None,
     niche: str = "",
-) -> list[str]:
+    main_characters: Optional[List[str]] = None,
+    is_first_segment: bool = False,
+) -> tuple:
     """
     使用 Claude API 理解文案内容，生成定制化的分镜描述
 
@@ -82,9 +84,11 @@ def _call_claude_for_storyboard(
         pet_context: 宠物上下文
         channel_id: 频道ID
         provider_id: AI Provider ID
+        main_characters: 主角特征列表（从第一段传递过来）
+        is_first_segment: 是否是第一段（需要生成主角特征）
 
     Returns:
-        分镜描述列表
+        (分镜描述列表, 主体, 动作, 场景, 主角特征列表)
     """
     pet_label = pet_context.get("pet_label", "狗狗")
     profile = _channel_profile(channel_id)
@@ -102,11 +106,51 @@ def _call_claude_for_storyboard(
     # 根据时长计算分镜数量
     shot_count = max(2, min(8, duration // 2))
 
+    # 根据是否是第一段，调整 main_characters 的格式说明
+    if is_first_segment:
+        main_characters_format = '["主角1特征描述"] 或 ["角色1：特征", "角色2：特征"] （如果有多个主角）'
+        main_characters_requirement = '必须输出！根据文案确定主角的具体特征（品种、毛色、体型、气质），如果有多个主角需要分别描述'
+    else:
+        main_characters_format = '（已在第一段确定，本段无需输出此字段）'
+        main_characters_requirement = '本段无需输出此字段，主角特征已在第一段确定'
+
+    # 构建主角一致性说明
+    character_consistency_note = ""
+    if main_characters and not is_first_segment:
+        # 后续段落：使用已确定的主角特征
+        characters_desc = "、".join(main_characters)
+        character_consistency_note = f"""
+# 主角特征（必须严格遵守！）
+本视频的主角特征已在第一段确定，所有段落必须保持一致：
+{characters_desc}
+
+**重要**：主角的品种、颜色、体型、气质等核心特征必须与上述描述完全一致，不要改变！
+如果文案中提到其他猫狗（配角），可以自由设计，但主角必须保持一致。
+"""
+    elif is_first_segment:
+        # 第一段：需要确定主角特征
+        character_consistency_note = f"""
+# 主角特征确定（第一段重要任务！）
+这是本视频的第一段，你需要根据文案内容确定主角的具体特征。
+主角特征将在后续所有段落中保持一致，所以请仔细设计。
+
+**主角特征要求**：
+- 如果文案明确提到品种（如"金毛"、"橘猫"），必须使用该品种
+- 如果文案没有明确品种，根据内容氛围选择合适的品种
+- 描述要包含：品种、毛色、体型、气质等核心特征
+- 描述要具体但不过度细节化（不要描述项圈颜色、具体伤疤等）
+- 如果有多个主角（如"老大、老二、老三"），需要分别描述每个角色的特征
+
+**示例**：
+- 单主角："金毛犬，奶油色毛发，大耳朵垂下，温柔眼神，体型中等偏大"
+- 多主角：["老大：橘猫，体型最大，毛色深橘，眼神淡定", "老二：狸花猫，虎斑纹路，体型中等，眼神警惕", "老三：白猫，体型最小，毛色纯白，眼神胆怯"]
+"""
+
     prompt = f"""你是专业的视频分镜师。请为以下文案设计精准的分镜描述。
 
 # 文案内容
 {segment_text}
-
+{character_consistency_note}
 # 基本信息
 - 时长：{duration}秒
 - 宠物类型：{pet_label}
@@ -148,12 +192,47 @@ def _call_claude_for_storyboard(
 - 要根据文案的具体情节设计画面
 - 每个分镜要有信息变化，不要重复
 
-## 优先级4：画面细节要求
+## 优先级4：镜头语言与转场过渡（重要！）
+
+**镜头类型要求：**
+- 每个分镜必须明确指定镜头类型（近景、特写、中景、全景、俯拍、仰拍等）
+- 镜头类型要根据内容需求选择，不要固定模式
+- 可选镜头类型：近景固定镜头、微距特写镜头、中景横移、中景推进、俯拍镜头、仰拍镜头、主观视角镜头、特写镜头、全景镜头、低角度跟拍等
+
+**转场连贯性要求：**
+- 相邻分镜之间要有自然的视觉过渡，避免跳跃感
+- 如果前一个分镜是特写，下一个可以是拉远的中景或全景
+- 如果前一个分镜是静态固定镜头，下一个可以是横移或推进
+- 如果前一个分镜是快速动作，下一个可以是慢速或静态镜头形成节奏对比
+- 场景转换时，可以用相似元素（如光线、色调、动作方向）来衔接
+
+**视觉效果与景深转场：**
+- 可以使用前景遮挡效果增加画面层次感（如：前景玻璃花瓶柔焦遮挡、前景植物叶片虚化、前景书本边缘虚化）
+- 可以使用景深变化作为转场（如：从浅景深特写过渡到深景深全景）
+- 可以使用光影变化作为转场（如：从暗部过渡到亮部、从侧光过渡到顶光）
+- 可以使用细微视差效果（前景和背景的移动速度差异）
+- 注意：前景遮挡物要根据场景自然选择（室内可以是花瓶、书本、杯子；户外可以是树叶、草丛、栏杆），不要固定使用某一种物体
+
+**转场示例：**
+- 特写猫咪眼睛 → 拉远到中景猫咪全身 → 全景展示整个房间
+- 固定镜头猫咪趴着 → 横移镜头跟随猫咪走动 → 俯拍镜头猫咪跳上沙发
+- 快速镜头猫咪奔跑 → 慢速镜头猫咪停下 → 静态镜头猫咪坐下
+- 前景花瓶柔焦遮挡，焦点在猫咪 → 拉远全景展示房间 → 俯拍猫咪在地毯上
+- 窗边侧光特写 → 中景横移跟随 → 前景窗帘虚化，猫咪在背景
+
+## 优先级5：画面细节要求
 
 - 用动画化的方式表现抽象概念（如等级观念可以用光圈层级、赌可以用期待的眼神）
 - 科普内容用温馨的动画符号（气味粒子、情绪云团、光圈等）
 - 不要出现任何字幕、中文文字、英文文字、小标签、手写体文字、屏幕文字
-- 镜头类型参考：近景固定镜头、微距特写镜头、中景轻微横移、俯拍镜头、主观视角镜头、特写镜头
+
+## 优先级6：音频要求（重要！）
+
+- **严禁背景音乐**：不要背景音乐、不要配乐、不要BGM，避免每段视频音乐不一致导致合成时衔接不上
+- **保留自然音效**：可以有环境音效（脚步声、爪子踩地声、球落地声、布料摩擦声、风声、草地声、室内环境声）
+- **保留动物声音**：可以有动物自然声音（猫咪呼噜声、轻微呼吸声、小动物叫声）
+- **允许感叹音效**：可以有感叹音效（惊讶声"啊"、轻笑声、叹气声），但不要完整的说话内容
+- **口型但无语言**：人物可以有口型动作（如张嘴、微笑），但不要发出清晰的语言声音
 
 ## 内化但不输出的规则
 - 开头策略：{hook_strategy}
@@ -161,6 +240,7 @@ def _call_claude_for_storyboard(
 - 留存节奏：{retention_structure}
 - 画面密度：{density_rule}
 - 不要在输出中写爆款开头策略、前3秒视觉钩子等标签，只输出可见画面
+- 音频规则：不要背景音乐/配乐/BGM，只保留自然音效和感叹音效
 
 # 输出格式
 输出 JSON 格式，包含分镜列表和分镜元素：
@@ -169,15 +249,20 @@ def _call_claude_for_storyboard(
   "subject": "本段核心主体（如：金毛叼着球、柴犬甩头拽玩具）",
   "action": "本段核心动作（如：叼球不给主人、甩头邀请拽玩具、放球脚边退后）",
   "scene": "本段核心场景（如：客厅地板、草地、窗边）",
+  "main_characters": {main_characters_format},
   "storyboard": [
     "0-2秒：近景固定镜头，[具体画面描述，必须符合文案内容]",
-    "2-4秒：微距特写镜头，缓慢推近，[具体画面描述]"
+    "2-4秒：中景缓慢推进，[具体画面描述，注意与上一镜的过渡]",
+    "4-6秒：特写镜头，[具体画面描述，注意与上一镜的过渡]"
   ]
 }}
 
 要求：
 - subject/action/scene 必须从文案中提取具体内容，不要用日常互动、温馨客厅这类泛化词
-- 每个分镜描述要具体、可执行
+- main_characters: {main_characters_requirement}
+- 每个分镜描述必须包含：时间轴 + 镜头类型 + 具体画面内容
+- 镜头类型要多样化，不要重复使用同一种镜头
+- 相邻分镜之间要考虑转场的自然过渡
 - 必须体现文案的核心情节
 - 不要输出任何解释或说明
 - 只输出 JSON
@@ -214,18 +299,31 @@ def _call_claude_for_storyboard(
                 action = str(data.get("action") or "日常互动")
                 scene = str(data.get("scene") or "温馨客厅")
                 storyboard_raw = data.get("storyboard") or []
+
+                # 提取主角特征（仅第一段）
+                extracted_characters = None
+                if is_first_segment:
+                    characters_data = data.get("main_characters")
+                    if characters_data:
+                        if isinstance(characters_data, list):
+                            extracted_characters = characters_data
+                        elif isinstance(characters_data, str):
+                            extracted_characters = [characters_data]
+                        print(f"  ✓ 提取到主角特征：{extracted_characters}")
             else:
                 # 兜底：如果不是 JSON，按原来的行解析
                 subject = f"{pet_label}日常互动"
                 action = "日常互动"
                 scene = "温馨客厅"
                 storyboard_raw = [line.strip() for line in text.strip().split('\n') if line.strip()]
+                extracted_characters = None
         except (json.JSONDecodeError, AttributeError):
             # JSON 解析失败，按原来的行解析
             subject = f"{pet_label}日常互动"
             action = "日常互动"
             scene = "温馨客厅"
             storyboard_raw = [line.strip() for line in text.strip().split('\n') if line.strip()]
+            extracted_characters = None
 
         # 清理分镜列表
         storyboard = []
@@ -237,9 +335,9 @@ def _call_claude_for_storyboard(
             storyboard.append(line)
 
         if storyboard:
-            return storyboard, subject, action, scene
+            return storyboard, subject, action, scene, extracted_characters
         else:
-            return ([f"0-{duration}秒：{pet_label}日常互动，温馨场景"], f"{pet_label}", "日常互动", "温馨客厅")
+            return ([f"0-{duration}秒：{pet_label}日常互动，温馨场景"], f"{pet_label}", "日常互动", "温馨客厅", extracted_characters)
 
     except Exception as exc:
         print(f"⚠️ AI 生成分镜失败，使用默认分镜：{exc}")
@@ -251,7 +349,8 @@ def _call_claude_for_storyboard(
             ],
             f"{pet_label}",
             "日常互动",
-            "温馨客厅"
+            "温馨客厅",
+            None  # 失败时没有主角特征
         )
 
 
@@ -272,6 +371,7 @@ def generate_video_prompts(
         channel_id: 频道ID（用于获取频道风格）
         scene_continuity: 是否保持场景连贯性
         provider_id: AI Provider ID
+        niche: 赛道
 
     Returns:
         每个段落的提示词配置列表
@@ -284,31 +384,55 @@ def generate_video_prompts(
 
     prompts = []
 
+    # 主角特征注册表：从第一段提取，后续段落复用
+    main_characters = None
+
     print(f"\n🎬 开始生成 {len(segments)} 个段落的视频提示词...")
 
     # 为每个段落生成提示词
     for i, seg in enumerate(segments, 1):
+        is_first_segment = (i == 1)
         print(f"  [{i}/{len(segments)}] 正在为段落 {seg['index']} 生成分镜...")
 
         # 分析关键词
         keywords = analyze_keywords(seg["text"], pet_context)
 
+        # 强制限制 duration 在 4-15 秒范围内（视频模型限制）
+        safe_duration = max(4, min(15, int(seg["estimated_duration"])))
+
         # 使用 AI 生成定制化分镜（理解文案内容）
-        storyboard, subject, action, scene = _call_claude_for_storyboard(
+        storyboard, subject, action, scene, extracted_characters = _call_claude_for_storyboard(
             segment_text=seg["text"],
-            duration=int(seg["estimated_duration"]),
+            duration=safe_duration,
             pet_context=pet_context,
             channel_id=channel_id,
             provider_id=provider_id,
             niche=niche,
+            main_characters=main_characters,
+            is_first_segment=is_first_segment,
         )
+
+        # 如果是第一段且提取到了主角特征，保存下来
+        if is_first_segment and extracted_characters:
+            main_characters = extracted_characters
+            print(f"  ✓ 主角特征已确定，将在后续 {len(segments) - 1} 个段落中保持一致")
+        elif is_first_segment and not extracted_characters:
+            # 第一段没有提取到主角特征，使用兜底方案
+            if pet_context.get("breed_detected"):
+                # 如果检测到了品种，使用品种描述
+                main_characters = [pet_context["subject_style"]]
+                print(f"  ⚠️ AI未返回主角特征，使用检测到的品种：{main_characters}")
+            else:
+                # 使用默认描述
+                main_characters = [f"{pet_context['pet_label']}，具体特征由视频模型自然生成"]
+                print(f"  ⚠️ AI未返回主角特征，使用默认描述")
 
         print(f"    ✓ 生成了 {len(storyboard)} 个分镜")
 
-        # 构建 SeedanceSegment 对象
+        # 构建 SeedanceSegment 对象（使用安全的 duration）
         seedance_seg = SeedanceSegment(
             index=seg["index"],
-            duration=int(seg["estimated_duration"]),
+            duration=safe_duration,
             transcript=seg["text"],
             function=f"段落{seg['index']}",
             main_action=action,  # 使用 AI 提取的动作
@@ -318,12 +442,13 @@ def generate_video_prompts(
             prompt="",  # 将由 build_prompt_for_segment 生成
         )
 
-        # 使用 Seedance 的提示词生成逻辑
+        # 使用 Seedance 的提示词生成逻辑（传入主角特征）
         prompt_text = build_prompt_for_segment(
             segment=seedance_seg,
             pet_context=pet_context,
             material_refs=None,
             channel_id=channel_id,
+            main_characters=main_characters,  # 传入主角特征
         )
 
         prompts.append({
@@ -331,7 +456,7 @@ def generate_video_prompts(
             "segment_text": seg["text"],
             "start_time": seg["start_time"],
             "end_time": seg["end_time"],
-            "duration": seg["estimated_duration"],
+            "duration": safe_duration,  # 使用安全的 duration
             "prompt": prompt_text,
             "shot": "",  # Seedance 提示词已包含镜头信息
             "subject": subject,  # 使用 AI 提取的主体

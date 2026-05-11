@@ -521,6 +521,8 @@ def format_generation_report(metadata: dict | None) -> str:
     source_similarity = float(metadata.get("source_similarity") or 0)
     reference_similarity = float(metadata.get("top_reference_similarity") or 0)
     lines = ["\n\n---", "### 生成评估"]
+    if metadata.get("generation_id"):
+        lines.append(f"- **反馈追踪ID：** `{metadata['generation_id']}`")
     lines.append(f"- **爆款评分：** {int(viral_score.get('score') or 0)}/100")
     if viral_score.get("details"):
         lines.append(f"- **评分依据：** {'、'.join(viral_score['details'])}")
@@ -611,6 +613,27 @@ def generate_detailed(
         pattern_context += f"钩子类型分布：{stats['hook_types']}\n"
         pattern_context += f"高频爆款元素：{', '.join(stats['top_viral_elements'][:10])}\n"
 
+    learning_context = ""
+    try:
+        from .feedback.analyzer import build_learning_context
+
+        learned = build_learning_context(niche=niche or "", limit=10)
+        if learned.get("sample_size"):
+            learning_context = (
+                f"\n【最近发布反馈学习】共{learned['sample_size']}条复盘样本\n"
+                f"结果分布：{learned.get('result_levels')}\n"
+            )
+            if learned.get("must_use"):
+                learning_context += f"本次必须强化：{', '.join(learned['must_use'])}\n"
+            if learned.get("prefer"):
+                learning_context += f"优先使用：{', '.join(learned['prefer'])}\n"
+            if learned.get("avoid"):
+                learning_context += f"避免复用：{', '.join(learned['avoid'])}\n"
+            if learned.get("experiment"):
+                learning_context += f"可测试方向：{', '.join(learned['experiment'])}\n"
+    except Exception as exc:
+        print(f"⚠️ 读取反馈学习上下文失败，跳过：{exc}")
+
     format_blocks = "\n\n".join(
         [
             f"""【版本{i} - 钩子类型】
@@ -638,7 +661,7 @@ def generate_detailed(
 
     prompt = f"""你是一位顶级短视频爆款文案创作者。你的任务是直接交付可拍摄、可口播的短视频成片文案，不写创作说明，不写分析报告。
 
-{kb_context}{pattern_context}{niche_rules_block}
+{kb_context}{pattern_context}{learning_context}{niche_rules_block}
 ---
 现在请基于以上爆款数据和用户输入，创作{versions}个版本的爆款短视频文案。用户要求几个版本，你就只输出几个版本，不要多输出：
 
@@ -697,7 +720,6 @@ def generate_detailed(
         "top_reference_rank_score": max([item["rank_score"] for item in references] or [0]),
         "viral_score": viral_score,
     }
-    print("\n✅ 生成完毕\n")
     # 拆分成独立版本列表，每个版本含正文、质检结果、版本号、结构化字段
     by_review = {int(r.get("version") or 0): r for r in version_reviews}
     versions_list = []
@@ -718,6 +740,26 @@ def generate_detailed(
             "problems": review.get("problems") or [],
             "suggestion": review.get("suggestion") or "",
         })
+    try:
+        from .feedback.tracker import record_generation
+
+        generation_id = record_generation(
+            script=reviewed_result,
+            topic=topic,
+            niche=niche,
+            requirements=requirements,
+            hook_type=",".join(strategy.get("selected_patterns", {}).get("hook_types", [])[:3]),
+            structure=",".join(strategy.get("selected_patterns", {}).get("structures", [])[:3]),
+            reference_videos=[item.get("video_id", "") for item in references if item.get("video_id")],
+            generation_params={"versions": int(versions)},
+            metadata=metadata,
+        )
+        metadata["generation_id"] = generation_id
+        print(f"🧠 已记录生成ID：{generation_id}")
+    except Exception as exc:
+        print(f"⚠️ 记录生成反馈样本失败：{exc}")
+
+    print("\n✅ 生成完毕\n")
     return {
         "content": reviewed_result,
         "versions_list": versions_list,

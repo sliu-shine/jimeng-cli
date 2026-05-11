@@ -126,6 +126,15 @@ NO_DIALOGUE_CONSTRAINTS = str(PROMPT_CONFIG.get("global", {}).get("no_dialogue_c
     "人物和猫狗通过表情、动作和画面氛围表达情绪，嘴巴保持自然闭合或呼吸状态。"
 ))
 
+# 音频约束：禁止背景音乐，但保留自然音效
+AUDIO_CONSTRAINTS = str(PROMPT_CONFIG.get("global", {}).get("audio_constraints") or (
+    "不要背景音乐、不要配乐、不要BGM；"
+    "可以有自然环境音效（脚步声、爪子踩地声、球落地声、布料摩擦声、风声、草地声、室内环境声）；"
+    "可以有动物自然声音（猫咪呼噜声、轻微呼吸声、小动物叫声）；"
+    "可以有感叹音效（惊讶声、轻笑声、叹气声），但不要完整的说话内容；"
+    "人物可以有口型动作，但不要发出清晰的语言声音。"
+))
+
 GLOBAL_NEGATIVE_CONSTRAINTS = str(PROMPT_CONFIG.get("global", {}).get("negative_constraints") or (
     "屏幕上不要出现任何字幕、中文文字、英文文字、水印、logo、账号名、标题贴纸。"
     "不要真实摄影、不要写实真人脸部、不要3D建模感、不要水印、不要低清晰度画面。"
@@ -133,7 +142,7 @@ GLOBAL_NEGATIVE_CONSTRAINTS = str(PROMPT_CONFIG.get("global", {}).get("negative_
 
 # 精简版固定内容：一句风格定性 + 核心视觉规则 + 一次负面约束，控制在150字以内
 # 每个频道在 channel_styles.json 里配置 style_compact，没有则自动从 style_template 截取前80字兜底
-_COMPACT_NEGATIVE = "无字幕文字水印，无真实摄影，无3D，无人声口型，嘴巴自然闭合。"
+_COMPACT_NEGATIVE = "无字幕文字水印，无真实摄影，无3D，无人声口型，嘴巴自然闭合，无背景音乐无配乐无BGM，只保留自然音效。"
 
 
 def _compact_style_for_channel(channel_id: str | None, pet_context: dict[str, str]) -> str:
@@ -505,14 +514,67 @@ class SeedanceSegment:
 
 
 def detect_pet_context(text: str) -> dict[str, str]:
+    """
+    检测宠物上下文，包括类型和品种
+
+    Returns:
+        包含宠物类型、标签、品种等信息的字典
+    """
     clean = str(text or "")
-    cat_score = sum(clean.count(word) for word in ["猫", "猫咪", "小猫", "狸花", "橘猫", "布偶", "英短", "喵", "呼噜", "踩奶", "猫砂"])
-    dog_score = sum(clean.count(word) for word in ["狗", "狗狗", "小狗", "金毛", "柯基", "柴犬", "拉布拉多", "汪", "摇尾巴", "护卫犬"])
+
+    # 检测猫的品种
+    cat_breeds = {
+        "橘猫": "橘猫，橘黄色毛发，圆润体型",
+        "狸花猫": "狸花猫，虎斑纹路，警惕眼神",
+        "布偶": "布偶猫，蓝色眼睛，长毛蓬松，优雅气质",
+        "英短": "英短猫，圆脸大眼，灰蓝色或金色毛发",
+        "美短": "美短猫，银色虎斑纹路，圆润体型",
+        "暹罗": "暹罗猫，深色面部和四肢，蓝色眼睛",
+        "波斯": "波斯猫，扁平脸，长毛蓬松",
+    }
+
+    # 检测狗的品种
+    dog_breeds = {
+        "金毛": "金毛犬，奶油色或金色毛发，大耳朵垂下，温柔眼神，体型中等偏大",
+        "柴犬": "柴犬，黄褐色毛发，尖耳朵竖立，卷尾巴，体型中等",
+        "柯基": "柯基犬，短腿长身，大耳朵竖立，黄白色毛发",
+        "拉布拉多": "拉布拉多犬，短毛，黄色或黑色，温和表情，体型大",
+        "哈士奇": "哈士奇，蓝色或异色眼睛，黑白毛色，竖耳",
+        "泰迪": "泰迪犬，卷毛蓬松，棕色或白色，体型小巧",
+        "边牧": "边境牧羊犬，黑白毛色，聪明眼神，体型中等",
+        "萨摩耶": "萨摩耶犬，纯白色长毛，微笑表情，体型大",
+    }
+
+    # 检测品种
+    detected_cat_breed = None
+    detected_dog_breed = None
+
+    for breed, description in cat_breeds.items():
+        if breed in clean:
+            detected_cat_breed = description
+            break
+
+    for breed, description in dog_breeds.items():
+        if breed in clean:
+            detected_dog_breed = description
+            break
+
+    # 计算猫狗分数
+    cat_score = sum(clean.count(word) for word in ["猫", "猫咪", "小猫", "喵", "呼噜", "踩奶", "猫砂"])
+    dog_score = sum(clean.count(word) for word in ["狗", "狗狗", "小狗", "汪", "摇尾巴", "护卫犬"])
+
+    # 如果检测到品种，加权
+    if detected_cat_breed:
+        cat_score += 10
+    if detected_dog_breed:
+        dog_score += 10
+
     if cat_score > dog_score:
         return {
             "kind": "cat",
             "pet_label": "猫咪",
-            "subject_style": "可爱的猫咪或本次内容指定猫咪，胡须细腻、耳朵灵动、尾巴动作自然",
+            "subject_style": detected_cat_breed or "可爱的猫咪，胡须细腻、耳朵灵动、尾巴动作自然",
+            "breed_detected": detected_cat_breed is not None,
             "love_phrase": "像在重新理解猫咪的爱",
             "strategy_label": "猫咪行为主线",
         }
@@ -520,7 +582,8 @@ def detect_pet_context(text: str) -> dict[str, str]:
         return {
             "kind": "dog",
             "pet_label": "狗狗",
-            "subject_style": "可爱的金毛犬或本次内容指定狗狗，耳朵灵动、尾巴动作自然",
+            "subject_style": detected_dog_breed or "可爱的狗狗，耳朵灵动、尾巴动作自然",
+            "breed_detected": detected_dog_breed is not None,
             "love_phrase": "像在重新理解狗狗的爱",
             "strategy_label": "狗狗行为主线",
         }
@@ -528,6 +591,7 @@ def detect_pet_context(text: str) -> dict[str, str]:
         "kind": "pet",
         "pet_label": "猫咪或狗狗",
         "subject_style": "可爱的猫咪或狗狗，优先遵循本次内容指定宠物，耳朵灵动、动作自然",
+        "breed_detected": False,
         "love_phrase": "像在重新理解毛孩子的爱",
         "strategy_label": "猫狗行为主线",
     }
@@ -812,21 +876,55 @@ def _shot_visuals(text: str, keywords: dict[str, list[str]], pet_context: dict[s
 
 
 def build_storyboard(duration: int, text: str, keywords: dict[str, list[str]], pet_context: dict[str, str], channel_id: str | None = None) -> list[str]:
+    """
+    构建分镜列表（兜底方案，当AI生成失败时使用）
+
+    注意：这个函数主要用于规则拆分的兜底场景。
+    在使用AI生成分镜时（prompt_agent.py），AI会直接生成包含镜头类型的完整分镜描述，
+    不需要再添加固定的镜头样式。
+    """
     count = _shot_count(duration, channel_id, keywords)
     visuals = _shot_visuals(text, keywords, pet_context, channel_id)
     has_event_visuals = bool(_matched_visual_events(text, pet_context))
     shots = []
     ranges = []
-    start = 0
-    for i in range(count):
-        end = duration if i == count - 1 else min(duration, start + 2)
-        ranges.append((start, end))
-        start = end
-        if start >= duration:
-            break
 
-    shot_styles = _channel_profile(channel_id)["shot_styles"]
+    # 计算每个分镜的时间段，确保均匀分布且不会出现无效时间段
+    if count <= 0:
+        count = 1
+
+    # 计算平均每个分镜的时长
+    avg_shot_duration = duration / count
+
+    for i in range(count):
+        start = round(i * avg_shot_duration, 1)
+        end = duration if i == count - 1 else round((i + 1) * avg_shot_duration, 1)
+
+        # 确保 end > start，避免出现 5-5秒 这种情况
+        if end <= start:
+            end = start + 0.5
+        if end > duration:
+            end = duration
+
+        ranges.append((start, end))
+
     profile = _channel_profile(channel_id)
+
+    # 兜底方案：使用简化的镜头样式列表
+    # 这些样式比较通用，不会出现"花瓶"这种具体物体
+    fallback_shot_styles = [
+        "近景镜头",
+        "中景镜头，轻微推进",
+        "特写镜头",
+        "全景镜头",
+        "俯拍镜头",
+        "固定镜头",
+    ]
+
+    # 使用文本哈希来选择镜头样式，保持一致性
+    import hashlib
+    text_hash = int(hashlib.md5(text.encode('utf-8')).hexdigest()[:8], 16)
+
     for idx, (start, end) in enumerate(ranges):
         visual = visuals[idx % len(visuals)]
         first_prefix = _render_profile_text(profile.get("first_shot_prefix"), pet_context)
@@ -841,7 +939,15 @@ def build_storyboard(duration: int, text: str, keywords: dict[str, list[str]], p
             ending_suffix = _render_profile_text(profile.get("ending_visual_suffix"), pet_context)
             if ending_suffix:
                 visual = f"{visual}，{ending_suffix}"
-        shots.append(f"{start}-{end}秒：{shot_styles[idx % len(shot_styles)]}，{visual}。")
+
+        # 使用通用的兜底镜头样式
+        shot_style_index = (text_hash + idx * 7) % len(fallback_shot_styles)
+        shot_style = fallback_shot_styles[shot_style_index]
+
+        # 格式化时间，去掉不必要的小数点
+        start_text = str(int(start)) if start == int(start) else str(start)
+        end_text = str(int(end)) if end == int(end) else str(end)
+        shots.append(f"{start_text}-{end_text}秒：{shot_style}，{visual}。")
     return shots
 
 
@@ -877,11 +983,23 @@ def _normalize_storyboard_timing(items: list[object], duration: int) -> list[str
     count = len(clean_items)
     safe_duration = max(1, int(duration or count))
     timed_items = []
+
+    # 计算平均每个分镜的时长
+    avg_shot_duration = safe_duration / count
+
     for index, item in enumerate(clean_items):
-        start = min(safe_duration, index * 2)
-        end = safe_duration if index == count - 1 else min(safe_duration, start + 2)
-        start_text = str(int(start)) if float(start).is_integer() else str(start)
-        end_text = str(int(end)) if float(end).is_integer() else str(end)
+        start = round(index * avg_shot_duration, 1)
+        end = safe_duration if index == count - 1 else round((index + 1) * avg_shot_duration, 1)
+
+        # 确保 end > start，避免出现无效时间段
+        if end <= start:
+            end = start + 0.5
+        if end > safe_duration:
+            end = safe_duration
+
+        # 格式化时间，去掉不必要的小数点
+        start_text = str(int(start)) if start == int(start) else str(start)
+        end_text = str(int(end)) if end == int(end) else str(end)
         timed_items.append(f"{start_text}-{end_text}秒：{item}")
     return timed_items
 
@@ -961,6 +1079,7 @@ def build_prompt_for_segment(
     pet_context: dict[str, str],
     material_refs: dict[str, str] | None = None,
     channel_id: str | None = None,
+    main_characters: list[str] | None = None,
 ) -> str:
     material_text = _material_instruction(material_refs)
     storyboard_items = _normalize_storyboard_timing(segment.storyboard, segment.duration)
@@ -973,8 +1092,16 @@ def build_prompt_for_segment(
     )
     compact_style = _compact_style_for_channel(channel_id, pet_context)
     motion = _render_profile_text(profile.get("motion"), pet_context)
+
+    # 构建主角特征描述
+    character_description = ""
+    if main_characters:
+        characters_text = "、".join(main_characters)
+        character_description = f"主角特征：{characters_text}。"
+
     return (
-        f"{compact_style} {_COMPACT_NEGATIVE} 16:9 横屏。{material_text}"
+        f"{compact_style} {_COMPACT_NEGATIVE} {AUDIO_CONSTRAINTS} 16:9 横屏。{material_text}"
+        f"{character_description}"
         f"本段主场景：{_sanitize_visual_text(segment.scene)}。"
         f"本段{pet_context['pet_label']}和主人状态：{_join_visual_state(segment.main_action, segment.emotion)}。"
         f"本段按时间轴分镜：{storyboard_text} "
@@ -1009,7 +1136,7 @@ def _ai_split_prompt(transcript: str, pet_context: dict[str, str], channel_id: s
 7. 第一段必须把最有停留价值的异常动作、反差结果或悬念画面提前到前3秒；后续段也要在开头快速给出本段信息点，不要慢铺垫。
 8. 不要机械套固定时间比例；根据内容灵活安排反差、递进、解释、情绪回收，但每个分镜都必须提供新动作、新信息或新情绪。
 9. 不要输出固定画风、负面约束和质量词，这些由程序统一注入。
-10. 严禁在 function、main_action、emotion、scene、storyboard 中出现或暗示：字幕、文字贴片、人物开口、宠物开口、人声朗读、聊天、对白、台词、口播、配音、旁白、解说；允许出现脚步声、爪子踩地声、球落地声、布料摩擦声、轻微呼吸声、猫咪自然呼噜声、风声、草地声和室内环境声。
+10. 严禁在 function、main_action、emotion、scene、storyboard 中出现或暗示：字幕、文字贴片、人物开口说话、宠物开口说话、人声朗读、聊天、对白、台词、口播、配音、旁白、解说、背景音乐、配乐、BGM；允许出现自然音效（脚步声、爪子踩地声、球落地声、布料摩擦声、轻微呼吸声、猫咪自然呼噜声、风声、草地声、室内环境声）和感叹音效（惊讶声、轻笑声、叹气声），人物可以有口型动作但不要清晰语言。
 11. 严禁在 storyboard 中写“对应……”“视觉重点……”“画面重点……”或复制输入文案原句；分镜只能写镜头中实际发生的可见动作和动画化示意。
 12. 情绪必须有转折：害怕/警惕的段落要画出身体压低、后缩、偷看、蜷缩；信任/撒欢的段落要画出奔跑、露肚皮、挤怀里、贴靠等具体动作。
 13. 只输出 JSON，不要 Markdown，不要解释。

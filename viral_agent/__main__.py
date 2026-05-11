@@ -47,6 +47,43 @@ def main():
     # stats 子命令
     subparsers.add_parser("stats", help="查看知识库状态")
 
+    # feedback 子命令
+    feedback_parser = subparsers.add_parser("feedback", help="视频发布反馈学习")
+    feedback_sub = feedback_parser.add_subparsers(dest="feedback_command")
+
+    feedback_list = feedback_sub.add_parser("list", help="列出最近生成记录")
+    feedback_list.add_argument("--limit", type=int, default=20)
+
+    feedback_add = feedback_sub.add_parser("add", help="手动录入某条视频表现数据")
+    feedback_add.add_argument("--generation-id", required=True, help="生成追踪ID")
+    feedback_add.add_argument("--video-id", default="", help="平台视频ID")
+    feedback_add.add_argument("--platform", default="douyin", help="平台")
+    feedback_add.add_argument("--title", default="", help="视频标题")
+    feedback_add.add_argument("--published-at", default="", help="发布时间")
+    feedback_add.add_argument("--duration", type=float, default=None, help="视频时长，秒")
+    feedback_add.add_argument("--views", type=int, default=0, help="播放量")
+    feedback_add.add_argument("--likes", type=int, default=0, help="点赞数")
+    feedback_add.add_argument("--comments", type=int, default=0, help="评论数")
+    feedback_add.add_argument("--favorites", type=int, default=0, help="收藏数")
+    feedback_add.add_argument("--shares", type=int, default=0, help="分享数")
+    feedback_add.add_argument("--completion-rate", type=float, default=None, help="完播率，可填 11.01 或 0.1101")
+    feedback_add.add_argument("--bounce-2s-rate", type=float, default=None, help="2s跳出率，可填 29.9 或 0.299")
+    feedback_add.add_argument("--completion-5s-rate", type=float, default=None, help="5s完播率，可填 48.72 或 0.4872")
+    feedback_add.add_argument("--avg-watch-seconds", type=float, default=None, help="平均播放时长，秒")
+    feedback_add.add_argument("--avg-watch-ratio", type=float, default=None, help="平均播放占比，可填 26.25 或 0.2625")
+    feedback_add.add_argument("--notes", default="", help="人工备注")
+    feedback_add.add_argument("--analyze", action="store_true", help="录入后立即复盘")
+
+    feedback_analyze = feedback_sub.add_parser("analyze", help="复盘某条视频反馈")
+    feedback_analyze.add_argument("--generation-id", required=True, help="生成追踪ID")
+    feedback_analyze.add_argument("--feedback-id", type=int, default=None, help="反馈记录ID，默认使用最新一条")
+    feedback_analyze.add_argument("--json", action="store_true", help="输出JSON")
+
+    feedback_context = feedback_sub.add_parser("context", help="查看最近反馈学习上下文")
+    feedback_context.add_argument("--niche", default="", help="赛道")
+    feedback_context.add_argument("--limit", type=int, default=10)
+    feedback_context.add_argument("--json", action="store_true", help="输出JSON")
+
     args = parser.parse_args()
 
     if args.command == "learn":
@@ -90,6 +127,73 @@ def main():
             for k, v in sorted(stats["hook_types"].items(), key=lambda x: -x[1]):
                 print(f"  {k}: {v}个")
             print(f"\n高频爆款元素：{', '.join(stats['top_viral_elements'][:10])}")
+
+    elif args.command == "feedback":
+        if args.feedback_command == "list":
+            from .feedback import list_generations
+
+            rows = list_generations(limit=args.limit)
+            if not rows:
+                print("还没有生成记录。先运行 generate 生成一条文案。")
+            for item in rows:
+                print(
+                    f"{item['id']} · {item.get('generated_at', '')[:19]} · "
+                    f"{item.get('niche') or '未填赛道'} · {item.get('topic') or '未命名主题'}"
+                )
+
+        elif args.feedback_command == "add":
+            from .feedback import add_video_feedback
+            from .feedback.analyzer import analyze_single_video, format_review_markdown
+
+            feedback_id = add_video_feedback(
+                generation_id=args.generation_id,
+                video_id=args.video_id,
+                platform=args.platform,
+                title=args.title,
+                published_at=args.published_at,
+                duration_seconds=args.duration,
+                views=args.views,
+                likes=args.likes,
+                comments=args.comments,
+                favorites=args.favorites,
+                shares=args.shares,
+                completion_rate=args.completion_rate,
+                bounce_2s_rate=args.bounce_2s_rate,
+                completion_5s_rate=args.completion_5s_rate,
+                avg_watch_seconds=args.avg_watch_seconds,
+                avg_watch_ratio=args.avg_watch_ratio,
+                notes=args.notes,
+            )
+            print(f"✅ 已录入反馈：feedback_id={feedback_id}")
+            if args.analyze:
+                review = analyze_single_video(args.generation_id, feedback_id=feedback_id)
+                print()
+                print(format_review_markdown(review))
+
+        elif args.feedback_command == "analyze":
+            from .feedback.analyzer import analyze_single_video, format_review_markdown
+
+            review = analyze_single_video(args.generation_id, feedback_id=args.feedback_id)
+            if args.json:
+                print(json.dumps(review, ensure_ascii=False, indent=2))
+            else:
+                print(format_review_markdown(review))
+
+        elif args.feedback_command == "context":
+            from .feedback import build_learning_context
+
+            context = build_learning_context(niche=args.niche, limit=args.limit)
+            if args.json:
+                print(json.dumps(context, ensure_ascii=False, indent=2))
+            else:
+                print(f"样本数：{context['sample_size']}")
+                print(f"结果分布：{context['result_levels']}")
+                print(f"must_use：{'；'.join(context['must_use'])}")
+                print(f"prefer：{'；'.join(context['prefer'])}")
+                print(f"avoid：{'；'.join(context['avoid'])}")
+                print(f"experiment：{'；'.join(context['experiment'])}")
+        else:
+            feedback_parser.print_help()
 
     else:
         parser.print_help()

@@ -212,6 +212,8 @@ def segment_by_sentences_ai(
                 for sub_text in sub_texts:
                     sub_chars = _count_chars(sub_text)
                     sub_duration = sub_chars / chars_per_second
+                    # 强制限制在15秒以内
+                    sub_duration = min(sub_duration, max_duration)
                     results.append({
                         "index": len(results) + 1,
                         "text": sub_text,
@@ -223,6 +225,8 @@ def segment_by_sentences_ai(
                     current_time += sub_duration
                 print(f"    ✓ 拆分为 {len(sub_texts)} 个子段落")
             else:
+                # 强制限制在15秒以内
+                duration = min(duration, max_duration)
                 results.append({
                     "index": len(results) + 1,
                     "text": segment_text,
@@ -332,6 +336,8 @@ def segment_by_sentences(
     for index, segment_text in enumerate(segments, start=1):
         char_count = _count_chars(segment_text)
         duration = char_count / chars_per_second
+        # 强制限制在15秒以内
+        duration = min(duration, max_duration)
 
         results.append({
             "index": index,
